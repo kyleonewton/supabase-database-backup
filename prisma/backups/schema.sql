@@ -1092,6 +1092,23 @@ CREATE TABLE IF NOT EXISTS "public"."invoices" (
 ALTER TABLE "public"."invoices" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."nas_sync_queue" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "kind" "text" NOT NULL,
+    "submission_id" "uuid" NOT NULL,
+    "status" "text" DEFAULT 'pending'::"text" NOT NULL,
+    "attempts" integer DEFAULT 0 NOT NULL,
+    "last_error" "text",
+    "last_attempt_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "nas_sync_queue_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'synced'::"text", 'failed'::"text"])))
+);
+
+
+ALTER TABLE "public"."nas_sync_queue" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."plant" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "description" "text" NOT NULL,
@@ -1477,6 +1494,16 @@ ALTER TABLE ONLY "public"."invoices"
 
 
 
+ALTER TABLE ONLY "public"."nas_sync_queue"
+    ADD CONSTRAINT "nas_sync_queue_kind_submission_unique" UNIQUE ("kind", "submission_id");
+
+
+
+ALTER TABLE ONLY "public"."nas_sync_queue"
+    ADD CONSTRAINT "nas_sync_queue_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."plant_inspection_items"
     ADD CONSTRAINT "plant_inspection_items_pkey" PRIMARY KEY ("id");
 
@@ -1658,6 +1685,10 @@ CREATE INDEX "invoices_invoice_date_idx" ON "public"."invoices" USING "btree" ("
 
 
 
+CREATE INDEX "nas_sync_queue_status_idx" ON "public"."nas_sync_queue" USING "btree" ("status", "created_at");
+
+
+
 CREATE INDEX "plant_inspections_project_id_idx" ON "public"."plant_inspections" USING "btree" ("project_id");
 
 
@@ -1775,6 +1806,10 @@ CREATE OR REPLACE TRIGGER "holidays_set_updated_at" BEFORE UPDATE ON "public"."h
 
 
 CREATE OR REPLACE TRIGGER "set_cost_company_aliases_updated_at" BEFORE UPDATE ON "public"."cost_company_aliases" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "set_nas_sync_queue_updated_at" BEFORE UPDATE ON "public"."nas_sync_queue" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
 
 
 
@@ -2133,6 +2168,10 @@ CREATE POLICY "Owner admin or manager update holidays" ON "public"."holidays" FO
 
 
 
+CREATE POLICY "Staff can view NAS sync queue" ON "public"."nas_sync_queue" FOR SELECT TO "authenticated" USING ("public"."is_staff"("auth"."uid"()));
+
+
+
 CREATE POLICY "Staff oversight view holidays" ON "public"."holidays" FOR SELECT TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'cjb_manager'::"public"."app_role") OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id")))));
 
 
@@ -2321,6 +2360,9 @@ ALTER TABLE "public"."invoices" ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "invoices admin all" ON "public"."invoices" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
 
+
+
+ALTER TABLE "public"."nas_sync_queue" ENABLE ROW LEVEL SECURITY;
 
 
 CREATE POLICY "photos manage by parent manager" ON "public"."submission_photos" TO "authenticated" USING ("public"."can_manage_submission"("public"."submission_owner"("kind", "submission_id"))) WITH CHECK ("public"."can_manage_submission"("public"."submission_owner"("kind", "submission_id")));
@@ -3179,6 +3221,12 @@ GRANT ALL ON TABLE "public"."invoice_clients" TO "service_role";
 GRANT ALL ON TABLE "public"."invoices" TO "anon";
 GRANT ALL ON TABLE "public"."invoices" TO "authenticated";
 GRANT ALL ON TABLE "public"."invoices" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."nas_sync_queue" TO "anon";
+GRANT ALL ON TABLE "public"."nas_sync_queue" TO "authenticated";
+GRANT ALL ON TABLE "public"."nas_sync_queue" TO "service_role";
 
 
 
