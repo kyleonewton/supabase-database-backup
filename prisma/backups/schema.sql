@@ -154,6 +154,26 @@ CREATE TYPE "public"."submission_status" AS ENUM (
 ALTER TYPE "public"."submission_status" OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."admin_set_vault_secret"("p_name" "text", "p_value" "text") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+  v_id uuid;
+begin
+  select id into v_id from vault.secrets where name = p_name;
+  if v_id is null then
+    perform vault.create_secret(p_value, p_name);
+  else
+    perform vault.update_secret(v_id, p_value);
+  end if;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."admin_set_vault_secret"("p_name" "text", "p_value" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."bump_revision"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -236,6 +256,31 @@ $_$;
 
 
 ALTER FUNCTION "public"."company_match_key"("p_name" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."continue_cost_scan"("p_url" "text", "p_apikey" "text") RETURNS bigint
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'net'
+    AS $$
+BEGIN
+  -- Service-role / internal only (no end-user JWT).
+  IF auth.uid() IS NOT NULL THEN
+    RAISE EXCEPTION 'Not allowed to continue cost scan';
+  END IF;
+  IF position('/api/public/hooks/scan-costs-inbox' IN p_url) = 0 THEN
+    RAISE EXCEPTION 'Invalid scan target URL';
+  END IF;
+  RETURN net.http_post(
+    url := p_url,
+    headers := jsonb_build_object('Content-Type', 'application/json', 'apikey', p_apikey),
+    body := '{}'::jsonb,
+    timeout_milliseconds := 120000
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."continue_cost_scan"("p_url" "text", "p_apikey" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."cost_invoices_apply_canonical_company"() RETURNS "trigger"
@@ -516,6 +561,52 @@ $$;
 ALTER FUNCTION "public"."is_staff"("_user_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."match_subcontractor_by_company"("p_company" "text") RETURNS "uuid"
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public', 'extensions'
+    AS $$
+DECLARE
+  v_key text;
+  v_id uuid;
+BEGIN
+  IF p_company IS NULL OR btrim(p_company) = '' OR upper(btrim(p_company)) = 'NA' THEN
+    RETURN NULL;
+  END IF;
+  v_key := public.company_match_key(p_company);
+  IF v_key IS NULL OR v_key = '' THEN
+    RETURN NULL;
+  END IF;
+
+  -- Exact normalised key wins.
+  SELECT s.id
+    INTO v_id
+    FROM public.subcontractors s
+    WHERE COALESCE(s.active, true) = true
+      AND public.company_match_key(s.name) = v_key
+    LIMIT 1;
+  IF v_id IS NOT NULL THEN
+    RETURN v_id;
+  END IF;
+
+  -- Fuzzy fallback against every active subcontractor name.
+  SELECT s.id
+    INTO v_id
+    FROM public.subcontractors s
+    WHERE COALESCE(s.active, true) = true
+      AND public.company_match_key(s.name) <> ''
+      AND similarity(public.company_match_key(s.name), v_key) >= 0.6
+    ORDER BY similarity(public.company_match_key(s.name), v_key) DESC,
+             char_length(public.company_match_key(s.name)) ASC
+    LIMIT 1;
+
+  RETURN v_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."match_subcontractor_by_company"("p_company" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."owns_submission"("_kind" "public"."submission_kind", "_submission_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -755,9 +846,6 @@ CREATE OR REPLACE FUNCTION "public"."trigger_cost_scan"("p_url" "text", "p_apike
     SET "search_path" TO 'public', 'net'
     AS $$
 BEGIN
-  -- Only the kylenaddy account may trigger from the app. Internal callers
-  -- (no JWT, e.g. maintenance jobs running as a superuser) have a null
-  -- auth.uid() and are allowed.
   IF auth.uid() IS NOT NULL
      AND NOT EXISTS (
        SELECT 1 FROM public.profiles
@@ -766,8 +854,6 @@ BEGIN
     RAISE EXCEPTION 'Not allowed to trigger cost scan';
   END IF;
 
-  -- Restrict the dispatcher to the cost-scan endpoint only (prevents this
-  -- SECURITY DEFINER function from being abused as a generic HTTP poster).
   IF position('/api/public/hooks/scan-costs-inbox' IN p_url) = 0 THEN
     RAISE EXCEPTION 'Invalid scan target URL';
   END IF;
@@ -776,7 +862,7 @@ BEGIN
     url := p_url,
     headers := jsonb_build_object('Content-Type', 'application/json', 'apikey', p_apikey),
     body := '{}'::jsonb,
-    timeout_milliseconds := 5000
+    timeout_milliseconds := 120000
   );
 END;
 $$;
@@ -822,6 +908,38 @@ CREATE TABLE IF NOT EXISTS "public"."cost_company_aliases" (
 ALTER TABLE "public"."cost_company_aliases" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."cost_company_subcontractors" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "canonical_company" "text" NOT NULL,
+    "subcontractor_id" "uuid" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."cost_company_subcontractors" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."cost_invoice_splits" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "cost_invoice_id" "uuid" NOT NULL,
+    "position" integer DEFAULT 0 NOT NULL,
+    "description" "text",
+    "project_id" "uuid",
+    "project_other" "text",
+    "is_overhead" boolean DEFAULT false NOT NULL,
+    "net_amount" numeric(12,2) DEFAULT 0 NOT NULL,
+    "vat_amount" numeric(12,2),
+    "cis_amount" numeric(12,2),
+    "total_amount" numeric(12,2),
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."cost_invoice_splits" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."cost_invoices" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "status" "public"."cost_invoice_status" DEFAULT 'pending_review'::"public"."cost_invoice_status" NOT NULL,
@@ -854,6 +972,14 @@ CREATE TABLE IF NOT EXISTS "public"."cost_invoices" (
     "paid_at" timestamp with time zone,
     "cis_amount" numeric(12,2),
     "document_type" "text" DEFAULT 'invoice'::"text" NOT NULL,
+    "nas_fallback_path" "text",
+    "project_id" "uuid",
+    "project_other" "text",
+    "is_overhead" boolean DEFAULT false NOT NULL,
+    "subcontractor_id" "uuid",
+    "timesheet_check_status" "text" DEFAULT 'unchecked'::"text" NOT NULL,
+    "timesheet_check_at" timestamp with time zone,
+    "timesheet_check_detail" "text",
     CONSTRAINT "cost_invoices_document_type_check" CHECK (("document_type" = ANY (ARRAY['invoice'::"text", 'credit_note'::"text"])))
 );
 
@@ -881,6 +1007,9 @@ CREATE TABLE IF NOT EXISTS "public"."cost_scan_state" (
     "last_error" "text",
     "last_result" "jsonb",
     "manual_catchup_since" timestamp with time zone,
+    "scan_in_progress" boolean DEFAULT false NOT NULL,
+    "scan_lock_at" timestamp with time zone,
+    "scan_cursor_uid" bigint,
     CONSTRAINT "cost_scan_state_singleton" CHECK (("id" = 1))
 );
 
@@ -1065,6 +1194,23 @@ CREATE TABLE IF NOT EXISTS "public"."invoice_clients" (
 
 
 ALTER TABLE "public"."invoice_clients" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."invoice_lines" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "invoice_id" "uuid" NOT NULL,
+    "position" integer DEFAULT 0 NOT NULL,
+    "site_name" "text",
+    "description" "text",
+    "amount_net" numeric(12,2) DEFAULT 0 NOT NULL,
+    "project_id" "uuid",
+    "project_other" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."invoice_lines" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."invoices" (
@@ -1409,6 +1555,21 @@ ALTER TABLE ONLY "public"."cost_company_aliases"
 
 
 
+ALTER TABLE ONLY "public"."cost_company_subcontractors"
+    ADD CONSTRAINT "cost_company_subcontractors_canonical_company_key" UNIQUE ("canonical_company");
+
+
+
+ALTER TABLE ONLY "public"."cost_company_subcontractors"
+    ADD CONSTRAINT "cost_company_subcontractors_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."cost_invoice_splits"
+    ADD CONSTRAINT "cost_invoice_splits_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."cost_invoices"
     ADD CONSTRAINT "cost_invoices_pkey" PRIMARY KEY ("id");
 
@@ -1481,6 +1642,11 @@ ALTER TABLE ONLY "public"."holidays"
 
 ALTER TABLE ONLY "public"."invoice_clients"
     ADD CONSTRAINT "invoice_clients_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."invoice_lines"
+    ADD CONSTRAINT "invoice_lines_pkey" PRIMARY KEY ("id");
 
 
 
@@ -1677,6 +1843,22 @@ CREATE INDEX "holidays_user_start_idx" ON "public"."holidays" USING "btree" ("us
 
 
 
+CREATE INDEX "idx_cost_invoice_splits_cost_invoice_id" ON "public"."cost_invoice_splits" USING "btree" ("cost_invoice_id");
+
+
+
+CREATE INDEX "idx_cost_invoice_splits_project_id" ON "public"."cost_invoice_splits" USING "btree" ("project_id");
+
+
+
+CREATE INDEX "idx_invoice_lines_invoice_id" ON "public"."invoice_lines" USING "btree" ("invoice_id");
+
+
+
+CREATE INDEX "idx_invoice_lines_project_id" ON "public"."invoice_lines" USING "btree" ("project_id");
+
+
+
 CREATE INDEX "invoices_client_id_idx" ON "public"."invoices" USING "btree" ("client_id");
 
 
@@ -1809,6 +1991,18 @@ CREATE OR REPLACE TRIGGER "set_cost_company_aliases_updated_at" BEFORE UPDATE ON
 
 
 
+CREATE OR REPLACE TRIGGER "set_cost_company_subcontractors_updated_at" BEFORE UPDATE ON "public"."cost_company_subcontractors" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "set_cost_invoice_splits_updated_at" BEFORE UPDATE ON "public"."cost_invoice_splits" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "set_invoice_lines_updated_at" BEFORE UPDATE ON "public"."invoice_lines" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
 CREATE OR REPLACE TRIGGER "set_nas_sync_queue_updated_at" BEFORE UPDATE ON "public"."nas_sync_queue" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
 
 
@@ -1837,8 +2031,33 @@ CREATE OR REPLACE TRIGGER "trg_timesheets_snapshot" BEFORE INSERT OR UPDATE ON "
 
 
 
+ALTER TABLE ONLY "public"."cost_company_subcontractors"
+    ADD CONSTRAINT "cost_company_subcontractors_subcontractor_id_fkey" FOREIGN KEY ("subcontractor_id") REFERENCES "public"."subcontractors"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."cost_invoice_splits"
+    ADD CONSTRAINT "cost_invoice_splits_cost_invoice_id_fkey" FOREIGN KEY ("cost_invoice_id") REFERENCES "public"."cost_invoices"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."cost_invoice_splits"
+    ADD CONSTRAINT "cost_invoice_splits_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id") ON DELETE SET NULL;
+
+
+
 ALTER TABLE ONLY "public"."cost_invoices"
     ADD CONSTRAINT "cost_invoices_duplicate_of_fkey" FOREIGN KEY ("duplicate_of") REFERENCES "public"."cost_invoices"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."cost_invoices"
+    ADD CONSTRAINT "cost_invoices_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."cost_invoices"
+    ADD CONSTRAINT "cost_invoices_subcontractor_id_fkey" FOREIGN KEY ("subcontractor_id") REFERENCES "public"."subcontractors"("id") ON DELETE SET NULL;
 
 
 
@@ -1924,6 +2143,16 @@ ALTER TABLE ONLY "public"."holidays"
 
 ALTER TABLE ONLY "public"."holidays"
     ADD CONSTRAINT "holidays_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."invoice_lines"
+    ADD CONSTRAINT "invoice_lines_invoice_id_fkey" FOREIGN KEY ("invoice_id") REFERENCES "public"."invoices"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."invoice_lines"
+    ADD CONSTRAINT "invoice_lines_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id") ON DELETE SET NULL;
 
 
 
@@ -2210,6 +2439,20 @@ CREATE POLICY "clients read authed" ON "public"."clients" FOR SELECT TO "authent
 ALTER TABLE "public"."cost_company_aliases" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."cost_company_subcontractors" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "cost_company_subcontractors admin all" ON "public"."cost_company_subcontractors" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
+ALTER TABLE "public"."cost_invoice_splits" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "cost_invoice_splits admin all" ON "public"."cost_invoice_splits" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
 ALTER TABLE "public"."cost_invoices" ENABLE ROW LEVEL SECURITY;
 
 
@@ -2240,7 +2483,7 @@ CREATE POLICY "db cjb_manager read" ON "public"."daily_briefings" FOR SELECT TO 
 
 
 
-CREATE POLICY "db owner insert" ON "public"."daily_briefings" FOR INSERT TO "authenticated" WITH CHECK (("briefer_id" = "auth"."uid"()));
+CREATE POLICY "db owner insert" ON "public"."daily_briefings" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_manage_submission"("briefer_id"));
 
 
 
@@ -2355,6 +2598,13 @@ CREATE POLICY "invoice_clients admin all" ON "public"."invoice_clients" TO "auth
 
 
 
+ALTER TABLE "public"."invoice_lines" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "invoice_lines admin all" ON "public"."invoice_lines" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
 ALTER TABLE "public"."invoices" ENABLE ROW LEVEL SECURITY;
 
 
@@ -2389,7 +2639,7 @@ CREATE POLICY "pi manage update" ON "public"."plant_inspections" FOR UPDATE TO "
 
 
 
-CREATE POLICY "pi owner insert" ON "public"."plant_inspections" FOR INSERT TO "authenticated" WITH CHECK (("worker_id" = "auth"."uid"()));
+CREATE POLICY "pi owner insert" ON "public"."plant_inspections" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_manage_submission"("worker_id"));
 
 
 
@@ -2477,7 +2727,7 @@ CREATE POLICY "rams manage update" ON "public"."rams_briefings" FOR UPDATE TO "a
 
 
 
-CREATE POLICY "rams owner insert" ON "public"."rams_briefings" FOR INSERT TO "authenticated" WITH CHECK (("briefer_id" = "auth"."uid"()));
+CREATE POLICY "rams owner insert" ON "public"."rams_briefings" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_manage_submission"("briefer_id"));
 
 
 
@@ -2547,7 +2797,7 @@ CREATE POLICY "tbx cjb_manager read" ON "public"."toolbox_talks" FOR SELECT TO "
 
 
 
-CREATE POLICY "tbx owner insert" ON "public"."toolbox_talks" FOR INSERT TO "authenticated" WITH CHECK (("briefer_id" = "auth"."uid"()));
+CREATE POLICY "tbx owner insert" ON "public"."toolbox_talks" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_manage_submission"("briefer_id"));
 
 
 
@@ -2642,7 +2892,7 @@ CREATE POLICY "vd manage update" ON "public"."vehicle_defects" FOR UPDATE TO "au
 
 
 
-CREATE POLICY "vd owner insert" ON "public"."vehicle_defects" FOR INSERT TO "authenticated" WITH CHECK (("worker_id" = "auth"."uid"()));
+CREATE POLICY "vd owner insert" ON "public"."vehicle_defects" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_manage_submission"("worker_id"));
 
 
 
@@ -2962,6 +3212,11 @@ GRANT USAGE ON SCHEMA "public" TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "public"."admin_set_vault_secret"("p_name" "text", "p_value" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."admin_set_vault_secret"("p_name" "text", "p_value" "text") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."bump_revision"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."bump_revision"() TO "service_role";
 
@@ -2982,6 +3237,11 @@ GRANT ALL ON FUNCTION "public"."can_manage_submission"("_worker_id" "uuid") TO "
 GRANT ALL ON FUNCTION "public"."company_match_key"("p_name" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."company_match_key"("p_name" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."company_match_key"("p_name" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."continue_cost_scan"("p_url" "text", "p_apikey" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."continue_cost_scan"("p_url" "text", "p_apikey" "text") TO "service_role";
 
 
 
@@ -3045,6 +3305,11 @@ GRANT ALL ON FUNCTION "public"."is_assigned_to_project"("_user_id" "uuid", "_pro
 REVOKE ALL ON FUNCTION "public"."is_staff"("_user_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."is_staff"("_user_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_staff"("_user_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."match_subcontractor_by_company"("p_company" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."match_subcontractor_by_company"("p_company" "text") TO "service_role";
 
 
 
@@ -3140,6 +3405,18 @@ GRANT ALL ON TABLE "public"."cost_company_aliases" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."cost_company_subcontractors" TO "anon";
+GRANT ALL ON TABLE "public"."cost_company_subcontractors" TO "authenticated";
+GRANT ALL ON TABLE "public"."cost_company_subcontractors" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."cost_invoice_splits" TO "anon";
+GRANT ALL ON TABLE "public"."cost_invoice_splits" TO "authenticated";
+GRANT ALL ON TABLE "public"."cost_invoice_splits" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."cost_invoices" TO "anon";
 GRANT ALL ON TABLE "public"."cost_invoices" TO "authenticated";
 GRANT ALL ON TABLE "public"."cost_invoices" TO "service_role";
@@ -3215,6 +3492,12 @@ GRANT ALL ON TABLE "public"."holidays" TO "service_role";
 GRANT ALL ON TABLE "public"."invoice_clients" TO "anon";
 GRANT ALL ON TABLE "public"."invoice_clients" TO "authenticated";
 GRANT ALL ON TABLE "public"."invoice_clients" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."invoice_lines" TO "anon";
+GRANT ALL ON TABLE "public"."invoice_lines" TO "authenticated";
+GRANT ALL ON TABLE "public"."invoice_lines" TO "service_role";
 
 
 
