@@ -314,6 +314,20 @@ $$;
 ALTER FUNCTION "public"."daily_briefing_autoapprove"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."email_domain"("p_from" "text") RETURNS "text"
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $_$
+  SELECT CASE
+    WHEN p_from IS NULL OR position('@' in p_from) = 0 THEN NULL
+    ELSE lower(btrim(regexp_replace(regexp_replace(p_from, '^.*@', ''), '[>"''\s;,]+$', '')))
+  END
+$_$;
+
+
+ALTER FUNCTION "public"."email_domain"("p_from" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."force_approved_status"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -547,6 +561,40 @@ $$;
 ALTER FUNCTION "public"."is_assigned_to_project"("_user_id" "uuid", "_project_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."is_generic_email_domain"("p_domain" "text") RETURNS boolean
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT lower(coalesce(p_domain, '')) IN (
+    'gmail.com','googlemail.com','outlook.com','hotmail.com','hotmail.co.uk',
+    'live.com','live.co.uk','yahoo.com','yahoo.co.uk','ymail.com','icloud.com',
+    'me.com','aol.com','msn.com','protonmail.com','proton.me','gmx.com','mail.com'
+  )
+$$;
+
+
+ALTER FUNCTION "public"."is_generic_email_domain"("p_domain" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."is_shared_invoice_portal_domain"("p_domain" "text") RETURNS boolean
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM unnest(ARRAY[
+      'causeway.com','basware.com','tungsten-network.com','tungstennetwork.com',
+      'coupahost.com','coupamail.com','ariba.com','sap.com','transactionnetwork.com'
+    ]) AS d
+    WHERE lower(coalesce(p_domain, '')) = d
+       OR lower(coalesce(p_domain, '')) LIKE '%.' || d
+  )
+$$;
+
+
+ALTER FUNCTION "public"."is_shared_invoice_portal_domain"("p_domain" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."is_staff"("_user_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -627,6 +675,25 @@ $$;
 ALTER FUNCTION "public"."owns_submission"("_kind" "public"."submission_kind", "_submission_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."profiles_guard_sensitive_self_update"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  -- Allow service-role / internal callers (auth.uid() IS NULL) and admins to
+  -- change any column. Everyone else cannot modify privilege-sensitive fields.
+  IF auth.uid() IS NOT NULL AND NOT public.has_role(auth.uid(), 'admin') THEN
+    NEW.subcontractor_id := OLD.subcontractor_id;
+    NEW.must_reset_password := OLD.must_reset_password;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."profiles_guard_sensitive_self_update"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."resolve_cost_company_canonical"("p_name" "text") RETURNS "text"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public', 'extensions'
@@ -679,6 +746,54 @@ $$;
 
 
 ALTER FUNCTION "public"."resolve_cost_company_canonical"("p_name" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text") RETURNS "text"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'extensions'
+    AS $$
+DECLARE
+  v_domain text;
+  v_count int;
+  v_canon text;
+  v_resolved text;
+  v_trusted boolean;
+BEGIN
+  v_domain := public.email_domain(p_from);
+  v_trusted := v_domain IS NOT NULL AND v_domain <> ''
+    AND NOT public.is_generic_email_domain(v_domain)
+    AND NOT public.is_shared_invoice_portal_domain(v_domain);
+
+  -- 1) Sender-domain identity: use it only if the domain maps to exactly one
+  --    known canonical supplier.
+  IF v_trusted THEN
+    SELECT count(DISTINCT canonical_name), min(canonical_name)
+      INTO v_count, v_canon
+      FROM public.cost_company_domain_aliases
+      WHERE domain = v_domain;
+    IF v_count = 1 THEN
+      RETURN v_canon;
+    END IF;
+  END IF;
+
+  -- 2) Fall back to name-based resolution (exact key, fuzzy >= 0.62, else new).
+  v_resolved := public.resolve_cost_company_canonical(p_name);
+
+  -- 3) Learn the domain -> canonical pairing for trusted domains so future
+  --    invoices from this sender stay consistent regardless of printed name.
+  IF v_trusted AND v_resolved IS NOT NULL
+     AND btrim(v_resolved) <> '' AND upper(btrim(v_resolved)) <> 'NA' THEN
+    INSERT INTO public.cost_company_domain_aliases (domain, canonical_name)
+    VALUES (v_domain, btrim(v_resolved))
+    ON CONFLICT (domain, canonical_name) DO NOTHING;
+  END IF;
+
+  RETURN v_resolved;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."rls_auto_enable"() RETURNS "event_trigger"
@@ -871,6 +986,20 @@ $$;
 ALTER FUNCTION "public"."trigger_cost_scan"("p_url" "text", "p_apikey" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."update_updated_at_column"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."update_updated_at_column"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."user_subcontractor"("_user_id" "uuid") RETURNS "uuid"
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -906,6 +1035,17 @@ CREATE TABLE IF NOT EXISTS "public"."cost_company_aliases" (
 
 
 ALTER TABLE "public"."cost_company_aliases" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."cost_company_domain_aliases" (
+    "domain" "text" NOT NULL,
+    "canonical_name" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."cost_company_domain_aliases" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."cost_company_subcontractors" (
@@ -992,7 +1132,12 @@ CREATE TABLE IF NOT EXISTS "public"."cost_scan_skips" (
     "reason" "text" NOT NULL,
     "subject" "text",
     "source_from" "text",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "attempts" integer DEFAULT 1 NOT NULL,
+    "next_retry_at" timestamp with time zone,
+    "permanent" boolean DEFAULT false NOT NULL,
+    "last_error" "text",
+    "source_received_at" timestamp with time zone
 );
 
 
@@ -1440,7 +1585,9 @@ CREATE TABLE IF NOT EXISTS "public"."timesheets" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "snapshot_shift_rate" numeric(10,2),
     "rejection_reason" "text",
-    "revision" integer DEFAULT 1 NOT NULL
+    "revision" integer DEFAULT 1 NOT NULL,
+    "change_requested_at" timestamp with time zone,
+    "change_requested_by" "uuid"
 );
 
 
@@ -1555,6 +1702,11 @@ ALTER TABLE ONLY "public"."cost_company_aliases"
 
 
 
+ALTER TABLE ONLY "public"."cost_company_domain_aliases"
+    ADD CONSTRAINT "cost_company_domain_aliases_pkey" PRIMARY KEY ("domain", "canonical_name");
+
+
+
 ALTER TABLE ONLY "public"."cost_company_subcontractors"
     ADD CONSTRAINT "cost_company_subcontractors_canonical_company_key" UNIQUE ("canonical_company");
 
@@ -1622,6 +1774,11 @@ ALTER TABLE ONLY "public"."havs_log_items"
 
 ALTER TABLE ONLY "public"."havs_logs"
     ADD CONSTRAINT "havs_logs_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."havs_logs"
+    ADD CONSTRAINT "havs_logs_worker_day_unique" UNIQUE ("worker_id", "log_date");
 
 
 
@@ -1903,6 +2060,10 @@ CREATE INDEX "timesheets_worker_id_week_ending_idx" ON "public"."timesheets" USI
 
 
 
+CREATE UNIQUE INDEX "timesheets_worker_week_unique" ON "public"."timesheets" USING "btree" ("worker_id", "week_ending");
+
+
+
 CREATE INDEX "toolbox_talks_briefer_id_talk_date_idx" ON "public"."toolbox_talks" USING "btree" ("briefer_id", "talk_date" DESC);
 
 
@@ -1987,6 +2148,10 @@ CREATE OR REPLACE TRIGGER "holidays_set_updated_at" BEFORE UPDATE ON "public"."h
 
 
 
+CREATE OR REPLACE TRIGGER "profiles_guard_sensitive_self_update" BEFORE UPDATE ON "public"."profiles" FOR EACH ROW EXECUTE FUNCTION "public"."profiles_guard_sensitive_self_update"();
+
+
+
 CREATE OR REPLACE TRIGGER "set_cost_company_aliases_updated_at" BEFORE UPDATE ON "public"."cost_company_aliases" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
 
 
@@ -2028,6 +2193,10 @@ CREATE OR REPLACE TRIGGER "trg_timesheet_days_touch_parent" AFTER INSERT OR DELE
 
 
 CREATE OR REPLACE TRIGGER "trg_timesheets_snapshot" BEFORE INSERT OR UPDATE ON "public"."timesheets" FOR EACH ROW EXECUTE FUNCTION "public"."timesheets_snapshot_and_autoapprove"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_cost_company_domain_aliases_updated_at" BEFORE UPDATE ON "public"."cost_company_domain_aliases" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
@@ -2361,6 +2530,10 @@ CREATE POLICY "Admins manage cost company aliases" ON "public"."cost_company_ali
 
 
 
+CREATE POLICY "Admins manage cost company domain aliases" ON "public"."cost_company_domain_aliases" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
 CREATE POLICY "Admins read cost invoices" ON "public"."cost_invoices" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
@@ -2437,6 +2610,9 @@ CREATE POLICY "clients read authed" ON "public"."clients" FOR SELECT TO "authent
 
 
 ALTER TABLE "public"."cost_company_aliases" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."cost_company_domain_aliases" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."cost_company_subcontractors" ENABLE ROW LEVEL SECURITY;
@@ -2832,9 +3008,9 @@ ALTER TABLE "public"."timesheet_days" ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "timesheet_days owner write unapproved" ON "public"."timesheet_days" TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."timesheets" "t"
-  WHERE (("t"."id" = "timesheet_days"."timesheet_id") AND ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR (("t"."worker_id" = "auth"."uid"()) AND (("t"."status" <> 'approved'::"public"."submission_status") OR "public"."is_staff"("auth"."uid"()))) OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("t"."worker_id")))))))) WITH CHECK ((EXISTS ( SELECT 1
+  WHERE (("t"."id" = "timesheet_days"."timesheet_id") AND ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR (("t"."worker_id" = "auth"."uid"()) AND (("t"."status" <> 'approved'::"public"."submission_status") OR "public"."is_staff"("auth"."uid"()) OR ("t"."change_requested_at" IS NOT NULL))) OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("t"."worker_id")))))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."timesheets" "t"
-  WHERE (("t"."id" = "timesheet_days"."timesheet_id") AND ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR (("t"."worker_id" = "auth"."uid"()) AND (("t"."status" <> 'approved'::"public"."submission_status") OR "public"."is_staff"("auth"."uid"()))) OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("t"."worker_id"))))))));
+  WHERE (("t"."id" = "timesheet_days"."timesheet_id") AND ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR (("t"."worker_id" = "auth"."uid"()) AND (("t"."status" <> 'approved'::"public"."submission_status") OR "public"."is_staff"("auth"."uid"()) OR ("t"."change_requested_at" IS NOT NULL))) OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("t"."worker_id"))))))));
 
 
 
@@ -2859,7 +3035,7 @@ CREATE POLICY "timesheets read scope" ON "public"."timesheets" FOR SELECT TO "au
 
 
 
-CREATE POLICY "timesheets update owner unapproved or staff" ON "public"."timesheets" FOR UPDATE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR (("worker_id" = "auth"."uid"()) AND ("status" <> 'approved'::"public"."submission_status")) OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("worker_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("worker_id")))));
+CREATE POLICY "timesheets update owner unapproved or staff" ON "public"."timesheets" FOR UPDATE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR (("worker_id" = "auth"."uid"()) AND (("status" <> 'approved'::"public"."submission_status") OR ("change_requested_at" IS NOT NULL))) OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("worker_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("worker_id")))));
 
 
 
@@ -3255,6 +3431,12 @@ GRANT ALL ON FUNCTION "public"."daily_briefing_autoapprove"() TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."email_domain"("p_from" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."email_domain"("p_from" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."email_domain"("p_from" "text") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."force_approved_status"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."force_approved_status"() TO "service_role";
 
@@ -3302,6 +3484,18 @@ GRANT ALL ON FUNCTION "public"."is_assigned_to_project"("_user_id" "uuid", "_pro
 
 
 
+GRANT ALL ON FUNCTION "public"."is_generic_email_domain"("p_domain" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."is_generic_email_domain"("p_domain" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_generic_email_domain"("p_domain" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."is_shared_invoice_portal_domain"("p_domain" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."is_shared_invoice_portal_domain"("p_domain" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_shared_invoice_portal_domain"("p_domain" "text") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."is_staff"("_user_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."is_staff"("_user_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_staff"("_user_id" "uuid") TO "service_role";
@@ -3319,8 +3513,19 @@ GRANT ALL ON FUNCTION "public"."owns_submission"("_kind" "public"."submission_ki
 
 
 
+REVOKE ALL ON FUNCTION "public"."profiles_guard_sensitive_self_update"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."profiles_guard_sensitive_self_update"() TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."resolve_cost_company_canonical"("p_name" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."resolve_cost_company_canonical"("p_name" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text") TO "service_role";
 
 
 
@@ -3366,6 +3571,12 @@ GRANT ALL ON FUNCTION "public"."trigger_cost_scan"("p_url" "text", "p_apikey" "t
 
 
 
+GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "anon";
+GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."user_subcontractor"("_user_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."user_subcontractor"("_user_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."user_subcontractor"("_user_id" "uuid") TO "service_role";
@@ -3402,6 +3613,12 @@ GRANT ALL ON TABLE "public"."clients" TO "service_role";
 GRANT ALL ON TABLE "public"."cost_company_aliases" TO "anon";
 GRANT ALL ON TABLE "public"."cost_company_aliases" TO "authenticated";
 GRANT ALL ON TABLE "public"."cost_company_aliases" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."cost_company_domain_aliases" TO "anon";
+GRANT ALL ON TABLE "public"."cost_company_domain_aliases" TO "authenticated";
+GRANT ALL ON TABLE "public"."cost_company_domain_aliases" TO "service_role";
 
 
 
