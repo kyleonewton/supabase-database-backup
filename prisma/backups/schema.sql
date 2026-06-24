@@ -1162,6 +1162,19 @@ CREATE TABLE IF NOT EXISTS "public"."cost_scan_state" (
 ALTER TABLE "public"."cost_scan_state" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."cost_skip_attachments" (
+    "sha256" "text" NOT NULL,
+    "filename" "text",
+    "company_name" "text",
+    "reason" "text",
+    "source_message_id" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."cost_skip_attachments" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."daily_briefing_attendees" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "briefing_id" "uuid" NOT NULL,
@@ -1734,6 +1747,11 @@ ALTER TABLE ONLY "public"."cost_scan_skips"
 
 ALTER TABLE ONLY "public"."cost_scan_state"
     ADD CONSTRAINT "cost_scan_state_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."cost_skip_attachments"
+    ADD CONSTRAINT "cost_skip_attachments_pkey" PRIMARY KEY ("sha256");
 
 
 
@@ -2542,6 +2560,10 @@ CREATE POLICY "Admins read cost_scan_skips" ON "public"."cost_scan_skips" FOR SE
 
 
 
+CREATE POLICY "Admins read cost_skip_attachments" ON "public"."cost_skip_attachments" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
 CREATE POLICY "Admins read scan state" ON "public"."cost_scan_state" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
@@ -2638,6 +2660,9 @@ ALTER TABLE "public"."cost_scan_skips" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."cost_scan_state" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."cost_skip_attachments" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."daily_briefing_attendees" ENABLE ROW LEVEL SECURITY;
 
 
@@ -2677,9 +2702,9 @@ CREATE POLICY "db staff update" ON "public"."daily_briefings" FOR UPDATE TO "aut
 
 CREATE POLICY "db_att owner write" ON "public"."daily_briefing_attendees" TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."daily_briefings" "b"
-  WHERE (("b"."id" = "daily_briefing_attendees"."briefing_id") AND ("b"."briefer_id" = "auth"."uid"()))))) WITH CHECK ((EXISTS ( SELECT 1
+  WHERE (("b"."id" = "daily_briefing_attendees"."briefing_id") AND "public"."can_manage_submission"("b"."briefer_id"))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."daily_briefings" "b"
-  WHERE (("b"."id" = "daily_briefing_attendees"."briefing_id") AND ("b"."briefer_id" = "auth"."uid"())))));
+  WHERE (("b"."id" = "daily_briefing_attendees"."briefing_id") AND "public"."can_manage_submission"("b"."briefer_id")))));
 
 
 
@@ -2691,9 +2716,9 @@ CREATE POLICY "db_att read" ON "public"."daily_briefing_attendees" FOR SELECT TO
 
 CREATE POLICY "db_haz owner write" ON "public"."daily_briefing_hazards" TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."daily_briefings" "b"
-  WHERE (("b"."id" = "daily_briefing_hazards"."briefing_id") AND ("b"."briefer_id" = "auth"."uid"()))))) WITH CHECK ((EXISTS ( SELECT 1
+  WHERE (("b"."id" = "daily_briefing_hazards"."briefing_id") AND "public"."can_manage_submission"("b"."briefer_id"))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."daily_briefings" "b"
-  WHERE (("b"."id" = "daily_briefing_hazards"."briefing_id") AND ("b"."briefer_id" = "auth"."uid"())))));
+  WHERE (("b"."id" = "daily_briefing_hazards"."briefing_id") AND "public"."can_manage_submission"("b"."briefer_id")))));
 
 
 
@@ -2825,9 +2850,9 @@ CREATE POLICY "pi read scope" ON "public"."plant_inspections" FOR SELECT TO "aut
 
 CREATE POLICY "pi_items owner write" ON "public"."plant_inspection_items" TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."plant_inspections" "p"
-  WHERE (("p"."id" = "plant_inspection_items"."inspection_id") AND ("p"."worker_id" = "auth"."uid"()))))) WITH CHECK ((EXISTS ( SELECT 1
+  WHERE (("p"."id" = "plant_inspection_items"."inspection_id") AND "public"."can_manage_submission"("p"."worker_id"))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."plant_inspections" "p"
-  WHERE (("p"."id" = "plant_inspection_items"."inspection_id") AND ("p"."worker_id" = "auth"."uid"())))));
+  WHERE (("p"."id" = "plant_inspection_items"."inspection_id") AND "public"."can_manage_submission"("p"."worker_id")))));
 
 
 
@@ -2913,9 +2938,9 @@ CREATE POLICY "rams read scope" ON "public"."rams_briefings" FOR SELECT TO "auth
 
 CREATE POLICY "rams_att owner write" ON "public"."rams_attendees" TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."rams_briefings" "b"
-  WHERE (("b"."id" = "rams_attendees"."briefing_id") AND ("b"."briefer_id" = "auth"."uid"()))))) WITH CHECK ((EXISTS ( SELECT 1
+  WHERE (("b"."id" = "rams_attendees"."briefing_id") AND "public"."can_manage_submission"("b"."briefer_id"))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."rams_briefings" "b"
-  WHERE (("b"."id" = "rams_attendees"."briefing_id") AND ("b"."briefer_id" = "auth"."uid"())))));
+  WHERE (("b"."id" = "rams_attendees"."briefing_id") AND "public"."can_manage_submission"("b"."briefer_id")))));
 
 
 
@@ -2991,9 +3016,9 @@ CREATE POLICY "tbx staff update" ON "public"."toolbox_talks" FOR UPDATE TO "auth
 
 CREATE POLICY "tbx_att owner write" ON "public"."toolbox_attendees" TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."toolbox_talks" "t"
-  WHERE (("t"."id" = "toolbox_attendees"."talk_id") AND ("t"."briefer_id" = "auth"."uid"()))))) WITH CHECK ((EXISTS ( SELECT 1
+  WHERE (("t"."id" = "toolbox_attendees"."talk_id") AND "public"."can_manage_submission"("t"."briefer_id"))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."toolbox_talks" "t"
-  WHERE (("t"."id" = "toolbox_attendees"."talk_id") AND ("t"."briefer_id" = "auth"."uid"())))));
+  WHERE (("t"."id" = "toolbox_attendees"."talk_id") AND "public"."can_manage_submission"("t"."briefer_id")))));
 
 
 
@@ -3078,9 +3103,9 @@ CREATE POLICY "vd read scope" ON "public"."vehicle_defects" FOR SELECT TO "authe
 
 CREATE POLICY "vd_items owner write" ON "public"."vehicle_defect_items" TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."vehicle_defects" "v"
-  WHERE (("v"."id" = "vehicle_defect_items"."defect_id") AND ("v"."worker_id" = "auth"."uid"()))))) WITH CHECK ((EXISTS ( SELECT 1
+  WHERE (("v"."id" = "vehicle_defect_items"."defect_id") AND "public"."can_manage_submission"("v"."worker_id"))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."vehicle_defects" "v"
-  WHERE (("v"."id" = "vehicle_defect_items"."defect_id") AND ("v"."worker_id" = "auth"."uid"())))));
+  WHERE (("v"."id" = "vehicle_defect_items"."defect_id") AND "public"."can_manage_submission"("v"."worker_id")))));
 
 
 
@@ -3649,6 +3674,12 @@ GRANT ALL ON TABLE "public"."cost_scan_skips" TO "service_role";
 GRANT ALL ON TABLE "public"."cost_scan_state" TO "anon";
 GRANT ALL ON TABLE "public"."cost_scan_state" TO "authenticated";
 GRANT ALL ON TABLE "public"."cost_scan_state" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."cost_skip_attachments" TO "anon";
+GRANT ALL ON TABLE "public"."cost_skip_attachments" TO "authenticated";
+GRANT ALL ON TABLE "public"."cost_skip_attachments" TO "service_role";
 
 
 
