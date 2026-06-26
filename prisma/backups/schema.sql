@@ -1155,6 +1155,7 @@ CREATE TABLE IF NOT EXISTS "public"."cost_scan_state" (
     "scan_in_progress" boolean DEFAULT false NOT NULL,
     "scan_lock_at" timestamp with time zone,
     "scan_cursor_uid" bigint,
+    "stop_requested" boolean DEFAULT false NOT NULL,
     CONSTRAINT "cost_scan_state_singleton" CHECK (("id" = 1))
 );
 
