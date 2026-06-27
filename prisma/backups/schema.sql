@@ -1060,6 +1060,25 @@ CREATE TABLE IF NOT EXISTS "public"."cost_company_subcontractors" (
 ALTER TABLE "public"."cost_company_subcontractors" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."cost_dated_scans" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "since_ms" bigint NOT NULL,
+    "until_ms" bigint DEFAULT 0 NOT NULL,
+    "cursor_uid" integer,
+    "in_progress" boolean DEFAULT true NOT NULL,
+    "lock_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "resume_count" integer DEFAULT 0 NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "last_error" "text",
+    "failed_at" timestamp with time zone,
+    "no_progress_count" integer DEFAULT 0 NOT NULL
+);
+
+
+ALTER TABLE "public"."cost_dated_scans" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."cost_invoice_splits" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "cost_invoice_id" "uuid" NOT NULL,
@@ -1731,6 +1750,16 @@ ALTER TABLE ONLY "public"."cost_company_subcontractors"
 
 
 
+ALTER TABLE ONLY "public"."cost_dated_scans"
+    ADD CONSTRAINT "cost_dated_scans_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."cost_dated_scans"
+    ADD CONSTRAINT "cost_dated_scans_since_ms_until_ms_key" UNIQUE ("since_ms", "until_ms");
+
+
+
 ALTER TABLE ONLY "public"."cost_invoice_splits"
     ADD CONSTRAINT "cost_invoice_splits_pkey" PRIMARY KEY ("id");
 
@@ -2219,6 +2248,10 @@ CREATE OR REPLACE TRIGGER "update_cost_company_domain_aliases_updated_at" BEFORE
 
 
 
+CREATE OR REPLACE TRIGGER "update_cost_dated_scans_updated_at" BEFORE UPDATE ON "public"."cost_dated_scans" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
 ALTER TABLE ONLY "public"."cost_company_subcontractors"
     ADD CONSTRAINT "cost_company_subcontractors_subcontractor_id_fkey" FOREIGN KEY ("subcontractor_id") REFERENCES "public"."subcontractors"("id") ON DELETE CASCADE;
 
@@ -2537,6 +2570,10 @@ CREATE POLICY "Admins can insert havs_tools" ON "public"."havs_tools" FOR INSERT
 
 
 
+CREATE POLICY "Admins can read dated scans" ON "public"."cost_dated_scans" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
 CREATE POLICY "Admins can update havs_tools" ON "public"."havs_tools" FOR UPDATE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
@@ -2643,6 +2680,9 @@ ALTER TABLE "public"."cost_company_subcontractors" ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "cost_company_subcontractors admin all" ON "public"."cost_company_subcontractors" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
 
+
+
+ALTER TABLE "public"."cost_dated_scans" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."cost_invoice_splits" ENABLE ROW LEVEL SECURITY;
@@ -3651,6 +3691,12 @@ GRANT ALL ON TABLE "public"."cost_company_domain_aliases" TO "service_role";
 GRANT ALL ON TABLE "public"."cost_company_subcontractors" TO "anon";
 GRANT ALL ON TABLE "public"."cost_company_subcontractors" TO "authenticated";
 GRANT ALL ON TABLE "public"."cost_company_subcontractors" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."cost_dated_scans" TO "anon";
+GRANT ALL ON TABLE "public"."cost_dated_scans" TO "authenticated";
+GRANT ALL ON TABLE "public"."cost_dated_scans" TO "service_role";
 
 
 
