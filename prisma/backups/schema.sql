@@ -70,7 +70,8 @@ CREATE TYPE "public"."app_role" AS ENUM (
     'worker',
     'manager',
     'admin',
-    'cjb_manager'
+    'cjb_manager',
+    'super_admin'
 );
 
 
@@ -314,6 +315,22 @@ $$;
 ALTER FUNCTION "public"."daily_briefing_autoapprove"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."delete_integration_secret"("p_name" "text") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF NOT public.has_role(auth.uid(), 'super_admin') THEN
+    RAISE EXCEPTION 'Only a super admin can delete integration secrets';
+  END IF;
+  DELETE FROM vault.secrets WHERE name = p_name;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."delete_integration_secret"("p_name" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."email_domain"("p_from" "text") RETURNS "text"
     LANGUAGE "sql" IMMUTABLE
     SET "search_path" TO 'public'
@@ -341,6 +358,28 @@ $$;
 
 
 ALTER FUNCTION "public"."force_approved_status"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_integration_secret"("p_name" "text") RETURNS "text"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_val text;
+BEGIN
+  -- Trusted server (service role, auth.uid() IS NULL) may always read.
+  -- A signed-in end user may only read if they are a super admin.
+  IF auth.uid() IS NOT NULL AND NOT public.has_role(auth.uid(), 'super_admin') THEN
+    RAISE EXCEPTION 'Only a super admin can read integration secrets';
+  END IF;
+  SELECT decrypted_secret INTO v_val
+    FROM vault.decrypted_secrets WHERE name = p_name;
+  RETURN v_val;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."get_integration_secret"("p_name" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."handle_new_user"() RETURNS "trigger"
@@ -388,7 +427,11 @@ CREATE OR REPLACE FUNCTION "public"."has_role"("_user_id" "uuid", "_role" "publi
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  select exists (select 1 from public.user_roles where user_id = _user_id and role = _role)
+  select exists (
+    select 1 from public.user_roles
+    where user_id = _user_id
+      and (role = _role or (role = 'super_admin' and _role = 'admin'))
+  )
 $$;
 
 
@@ -601,7 +644,8 @@ CREATE OR REPLACE FUNCTION "public"."is_staff"("_user_id" "uuid") RETURNS boolea
     AS $$
   SELECT EXISTS (
     SELECT 1 FROM public.user_roles
-    WHERE user_id = _user_id AND role IN ('manager','admin','cjb_manager')
+    WHERE user_id = _user_id
+      AND role IN ('manager','admin','cjb_manager','super_admin')
   )
 $$;
 
@@ -765,14 +809,18 @@ BEGIN
     AND NOT public.is_shared_invoice_portal_domain(v_domain);
 
   -- 1) Sender-domain identity: use it only if the domain maps to exactly one
-  --    known canonical supplier.
+  --    known canonical supplier. Reconcile the domain-derived name through the
+  --    name-based canonicaliser so it matches EXACTLY what the insert trigger
+  --    (cost_invoices_apply_canonical_company) will store on the row. Without
+  --    this the file could be filed under the domain name while the table row
+  --    shows the name-based canonical (e.g. "…Limited" vs "…Ltd").
   IF v_trusted THEN
     SELECT count(DISTINCT canonical_name), min(canonical_name)
       INTO v_count, v_canon
       FROM public.cost_company_domain_aliases
       WHERE domain = v_domain;
     IF v_count = 1 THEN
-      RETURN v_canon;
+      RETURN public.resolve_cost_company_canonical(v_canon);
     END IF;
   END IF;
 
@@ -826,6 +874,32 @@ $$;
 
 
 ALTER FUNCTION "public"."rls_auto_enable"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."set_integration_secret"("p_name" "text", "p_value" "text") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_id uuid;
+BEGIN
+  IF NOT public.has_role(auth.uid(), 'super_admin') THEN
+    RAISE EXCEPTION 'Only a super admin can set integration secrets';
+  END IF;
+  IF p_name IS NULL OR btrim(p_name) = '' THEN
+    RAISE EXCEPTION 'Secret name required';
+  END IF;
+  SELECT id INTO v_id FROM vault.secrets WHERE name = p_name;
+  IF v_id IS NULL THEN
+    PERFORM vault.create_secret(p_value, p_name);
+  ELSE
+    PERFORM vault.update_secret(v_id, p_value);
+  END IF;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."set_integration_secret"("p_name" "text", "p_value" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."set_updated_at"() RETURNS "trigger"
@@ -962,10 +1036,7 @@ CREATE OR REPLACE FUNCTION "public"."trigger_cost_scan"("p_url" "text", "p_apike
     AS $$
 BEGIN
   IF auth.uid() IS NOT NULL
-     AND NOT EXISTS (
-       SELECT 1 FROM public.profiles
-       WHERE id = auth.uid() AND username = 'kylenaddy'
-     ) THEN
+     AND NOT public.has_role(auth.uid(), 'super_admin') THEN
     RAISE EXCEPTION 'Not allowed to trigger cost scan';
   END IF;
 
@@ -1013,6 +1084,16 @@ ALTER FUNCTION "public"."user_subcontractor"("_user_id" "uuid") OWNER TO "postgr
 SET default_tablespace = '';
 
 SET default_table_access_method = "heap";
+
+
+CREATE TABLE IF NOT EXISTS "public"."app_settings" (
+    "key" "text" NOT NULL,
+    "value" "text" NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."app_settings" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."clients" (
@@ -1072,7 +1153,8 @@ CREATE TABLE IF NOT EXISTS "public"."cost_dated_scans" (
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "last_error" "text",
     "failed_at" timestamp with time zone,
-    "no_progress_count" integer DEFAULT 0 NOT NULL
+    "no_progress_count" integer DEFAULT 0 NOT NULL,
+    "account_id" "uuid"
 );
 
 
@@ -1139,6 +1221,8 @@ CREATE TABLE IF NOT EXISTS "public"."cost_invoices" (
     "timesheet_check_status" "text" DEFAULT 'unchecked'::"text" NOT NULL,
     "timesheet_check_at" timestamp with time zone,
     "timesheet_check_detail" "text",
+    "company_invoice_key" "text" GENERATED ALWAYS AS (NULLIF("lower"("regexp_replace"("btrim"(COALESCE("company_name", ''::"text")), '\s+'::"text", ' '::"text", 'g'::"text")), ''::"text")) STORED,
+    "invoice_number_key" "text" GENERATED ALWAYS AS (NULLIF("upper"("regexp_replace"("btrim"(COALESCE("invoice_number", ''::"text")), '\s+'::"text", ''::"text", 'g'::"text")), ''::"text")) STORED,
     CONSTRAINT "cost_invoices_document_type_check" CHECK (("document_type" = ANY (ARRAY['invoice'::"text", 'credit_note'::"text"])))
 );
 
@@ -1156,7 +1240,8 @@ CREATE TABLE IF NOT EXISTS "public"."cost_scan_skips" (
     "next_retry_at" timestamp with time zone,
     "permanent" boolean DEFAULT false NOT NULL,
     "last_error" "text",
-    "source_received_at" timestamp with time zone
+    "source_received_at" timestamp with time zone,
+    "progress" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL
 );
 
 
@@ -1164,7 +1249,7 @@ ALTER TABLE "public"."cost_scan_skips" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."cost_scan_state" (
-    "id" smallint DEFAULT 1 NOT NULL,
+    "id" smallint NOT NULL,
     "last_uid_seen" bigint DEFAULT 0 NOT NULL,
     "last_run_at" timestamp with time zone,
     "last_success_at" timestamp with time zone,
@@ -1175,11 +1260,26 @@ CREATE TABLE IF NOT EXISTS "public"."cost_scan_state" (
     "scan_lock_at" timestamp with time zone,
     "scan_cursor_uid" bigint,
     "stop_requested" boolean DEFAULT false NOT NULL,
-    CONSTRAINT "cost_scan_state_singleton" CHECK (("id" = 1))
+    "account_id" "uuid"
 );
 
 
 ALTER TABLE "public"."cost_scan_state" OWNER TO "postgres";
+
+
+CREATE SEQUENCE IF NOT EXISTS "public"."cost_scan_state_id_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE "public"."cost_scan_state_id_seq" OWNER TO "postgres";
+
+
+ALTER SEQUENCE "public"."cost_scan_state_id_seq" OWNED BY "public"."cost_scan_state"."id";
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."cost_skip_attachments" (
@@ -1361,6 +1461,69 @@ CREATE TABLE IF NOT EXISTS "public"."holidays" (
 ALTER TABLE "public"."holidays" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."integration_email_accounts" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "label" "text" NOT NULL,
+    "email_address" "text" NOT NULL,
+    "purpose" "text" DEFAULT 'scan'::"text" NOT NULL,
+    "auth_method" "text" DEFAULT 'imap'::"text" NOT NULL,
+    "imap_host" "text" DEFAULT 'imap.gmail.com'::"text" NOT NULL,
+    "imap_port" integer DEFAULT 993 NOT NULL,
+    "smtp_host" "text" DEFAULT 'smtp.gmail.com'::"text" NOT NULL,
+    "smtp_port" integer DEFAULT 465 NOT NULL,
+    "oauth_provider" "text" DEFAULT 'google'::"text" NOT NULL,
+    "password_secret" "text",
+    "refresh_token_secret" "text",
+    "has_credentials" boolean DEFAULT false NOT NULL,
+    "is_active" boolean DEFAULT true NOT NULL,
+    "last_test_ok" boolean,
+    "last_test_at" timestamp with time zone,
+    "last_test_error" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "integration_email_accounts_auth_method_check" CHECK (("auth_method" = ANY (ARRAY['imap'::"text", 'oauth2'::"text"]))),
+    CONSTRAINT "integration_email_accounts_purpose_check" CHECK (("purpose" = ANY (ARRAY['scan'::"text", 'send'::"text", 'both'::"text"])))
+);
+
+
+ALTER TABLE "public"."integration_email_accounts" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."integration_oauth_providers" (
+    "provider" "text" NOT NULL,
+    "client_id" "text",
+    "client_secret_secret" "text",
+    "has_secret" boolean DEFAULT false NOT NULL,
+    "scopes" "text" DEFAULT 'https://mail.google.com/'::"text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."integration_oauth_providers" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."integration_storage_backends" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "label" "text" NOT NULL,
+    "type" "text" DEFAULT 'webdav'::"text" NOT NULL,
+    "config" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "username_secret" "text",
+    "password_secret" "text",
+    "has_credentials" boolean DEFAULT false NOT NULL,
+    "is_active" boolean DEFAULT false NOT NULL,
+    "last_test_ok" boolean,
+    "last_test_at" timestamp with time zone,
+    "last_test_error" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "integration_storage_backends_type_check" CHECK (("type" = ANY (ARRAY['webdav'::"text", 's3'::"text"])))
+);
+
+
+ALTER TABLE "public"."integration_storage_backends" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."invoice_clients" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "name" "text" NOT NULL,
@@ -1433,6 +1596,19 @@ CREATE TABLE IF NOT EXISTS "public"."nas_sync_queue" (
 ALTER TABLE "public"."nas_sync_queue" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."password_recovery_tokens" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "token_hash" "text" NOT NULL,
+    "expires_at" timestamp with time zone NOT NULL,
+    "used_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."password_recovery_tokens" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."plant" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "description" "text" NOT NULL,
@@ -1496,7 +1672,9 @@ CREATE TABLE IF NOT EXISTS "public"."profiles" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "subcontractor_id" "uuid",
     "must_reset_password" boolean DEFAULT true NOT NULL,
-    "last_active_at" timestamp with time zone
+    "last_active_at" timestamp with time zone,
+    "recovery_email" "text",
+    "mfa_enabled" boolean DEFAULT false NOT NULL
 );
 
 
@@ -1720,6 +1898,15 @@ CREATE TABLE IF NOT EXISTS "public"."vehicles" (
 ALTER TABLE "public"."vehicles" OWNER TO "postgres";
 
 
+ALTER TABLE ONLY "public"."cost_scan_state" ALTER COLUMN "id" SET DEFAULT "nextval"('"public"."cost_scan_state_id_seq"'::"regclass");
+
+
+
+ALTER TABLE ONLY "public"."app_settings"
+    ADD CONSTRAINT "app_settings_pkey" PRIMARY KEY ("key");
+
+
+
 ALTER TABLE ONLY "public"."clients"
     ADD CONSTRAINT "clients_name_key" UNIQUE ("name");
 
@@ -1845,6 +2032,21 @@ ALTER TABLE ONLY "public"."holidays"
 
 
 
+ALTER TABLE ONLY "public"."integration_email_accounts"
+    ADD CONSTRAINT "integration_email_accounts_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."integration_oauth_providers"
+    ADD CONSTRAINT "integration_oauth_providers_pkey" PRIMARY KEY ("provider");
+
+
+
+ALTER TABLE ONLY "public"."integration_storage_backends"
+    ADD CONSTRAINT "integration_storage_backends_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."invoice_clients"
     ADD CONSTRAINT "invoice_clients_pkey" PRIMARY KEY ("id");
 
@@ -1872,6 +2074,11 @@ ALTER TABLE ONLY "public"."nas_sync_queue"
 
 ALTER TABLE ONLY "public"."nas_sync_queue"
     ADD CONSTRAINT "nas_sync_queue_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."password_recovery_tokens"
+    ADD CONSTRAINT "password_recovery_tokens_pkey" PRIMARY KEY ("id");
 
 
 
@@ -1980,6 +2187,11 @@ ALTER TABLE ONLY "public"."user_roles"
 
 
 
+ALTER TABLE ONLY "public"."user_roles"
+    ADD CONSTRAINT "user_roles_user_id_unique" UNIQUE ("user_id");
+
+
+
 ALTER TABLE ONLY "public"."vehicle_defect_items"
     ADD CONSTRAINT "vehicle_defect_items_pkey" PRIMARY KEY ("id");
 
@@ -2028,6 +2240,14 @@ CREATE INDEX "cost_invoices_status_idx" ON "public"."cost_invoices" USING "btree
 
 
 
+CREATE UNIQUE INDEX "cost_invoices_unique_company_invoice_number" ON "public"."cost_invoices" USING "btree" ("company_invoice_key", "invoice_number_key") WHERE (("company_invoice_key" IS NOT NULL) AND ("invoice_number_key" IS NOT NULL) AND ("invoice_number_key" <> ALL (ARRAY['NA'::"text", 'N/A'::"text", 'NO-NUMBER'::"text", 'NONUMBER'::"text", 'NO_NUMBER'::"text"])));
+
+
+
+CREATE UNIQUE INDEX "cost_scan_state_account_uniq" ON "public"."cost_scan_state" USING "btree" ("account_id");
+
+
+
 CREATE INDEX "daily_briefings_briefer_id_time_delivered_idx" ON "public"."daily_briefings" USING "btree" ("briefer_id", "time_delivered" DESC);
 
 
@@ -2064,6 +2284,10 @@ CREATE INDEX "idx_invoice_lines_project_id" ON "public"."invoice_lines" USING "b
 
 
 
+CREATE UNIQUE INDEX "integration_storage_active_uniq" ON "public"."integration_storage_backends" USING "btree" ("is_active") WHERE "is_active";
+
+
+
 CREATE INDEX "invoices_client_id_idx" ON "public"."invoices" USING "btree" ("client_id");
 
 
@@ -2073,6 +2297,14 @@ CREATE INDEX "invoices_invoice_date_idx" ON "public"."invoices" USING "btree" ("
 
 
 CREATE INDEX "nas_sync_queue_status_idx" ON "public"."nas_sync_queue" USING "btree" ("status", "created_at");
+
+
+
+CREATE INDEX "password_recovery_tokens_hash_idx" ON "public"."password_recovery_tokens" USING "btree" ("token_hash");
+
+
+
+CREATE INDEX "password_recovery_tokens_user_idx" ON "public"."password_recovery_tokens" USING "btree" ("user_id");
 
 
 
@@ -2224,6 +2456,18 @@ CREATE OR REPLACE TRIGGER "toolbox_autoapprove_t" BEFORE INSERT ON "public"."too
 
 
 
+CREATE OR REPLACE TRIGGER "trg_integration_email_accounts_updated" BEFORE UPDATE ON "public"."integration_email_accounts" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_integration_oauth_providers_updated" BEFORE UPDATE ON "public"."integration_oauth_providers" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_integration_storage_backends_updated" BEFORE UPDATE ON "public"."integration_storage_backends" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
 CREATE OR REPLACE TRIGGER "trg_invoice_clients_updated" BEFORE UPDATE ON "public"."invoice_clients" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
 
 
@@ -2241,6 +2485,10 @@ CREATE OR REPLACE TRIGGER "trg_timesheet_days_touch_parent" AFTER INSERT OR DELE
 
 
 CREATE OR REPLACE TRIGGER "trg_timesheets_snapshot" BEFORE INSERT OR UPDATE ON "public"."timesheets" FOR EACH ROW EXECUTE FUNCTION "public"."timesheets_snapshot_and_autoapprove"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_app_settings_updated_at" BEFORE UPDATE ON "public"."app_settings" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
@@ -2384,6 +2632,11 @@ ALTER TABLE ONLY "public"."invoices"
 
 ALTER TABLE ONLY "public"."invoices"
     ADD CONSTRAINT "invoices_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."password_recovery_tokens"
+    ADD CONSTRAINT "password_recovery_tokens_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -2570,7 +2823,7 @@ CREATE POLICY "Admins can insert havs_tools" ON "public"."havs_tools" FOR INSERT
 
 
 
-CREATE POLICY "Admins can read dated scans" ON "public"."cost_dated_scans" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins can read dated scans" ON "public"."cost_dated_scans" FOR SELECT TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
 
 
 
@@ -2578,39 +2831,47 @@ CREATE POLICY "Admins can update havs_tools" ON "public"."havs_tools" FOR UPDATE
 
 
 
-CREATE POLICY "Admins delete cost invoices" ON "public"."cost_invoices" FOR DELETE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins delete cost invoices" ON "public"."cost_invoices" FOR DELETE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
 
 
 
-CREATE POLICY "Admins manage cost company aliases" ON "public"."cost_company_aliases" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins insert app settings" ON "public"."app_settings" FOR INSERT TO "authenticated" WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
 
-CREATE POLICY "Admins manage cost company domain aliases" ON "public"."cost_company_domain_aliases" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins manage cost company aliases" ON "public"."cost_company_aliases" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
 
 
 
-CREATE POLICY "Admins read cost invoices" ON "public"."cost_invoices" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins manage cost company domain aliases" ON "public"."cost_company_domain_aliases" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
 
 
 
-CREATE POLICY "Admins read cost_scan_skips" ON "public"."cost_scan_skips" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins read cost invoices" ON "public"."cost_invoices" FOR SELECT TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
 
 
 
-CREATE POLICY "Admins read cost_skip_attachments" ON "public"."cost_skip_attachments" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins read cost_scan_skips" ON "public"."cost_scan_skips" FOR SELECT TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
 
 
 
-CREATE POLICY "Admins read scan state" ON "public"."cost_scan_state" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins read cost_skip_attachments" ON "public"."cost_skip_attachments" FOR SELECT TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
 
 
 
-CREATE POLICY "Admins update cost invoices" ON "public"."cost_invoices" FOR UPDATE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins read scan state" ON "public"."cost_scan_state" FOR SELECT TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
 
 
 
-CREATE POLICY "Admins update scan state" ON "public"."cost_scan_state" FOR UPDATE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins update app settings" ON "public"."app_settings" FOR UPDATE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "Admins update cost invoices" ON "public"."cost_invoices" FOR UPDATE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+
+
+
+CREATE POLICY "Admins update scan state" ON "public"."cost_scan_state" FOR UPDATE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
 
 
 
@@ -2618,7 +2879,15 @@ CREATE POLICY "Anyone signed in can read havs_tools" ON "public"."havs_tools" FO
 
 
 
+CREATE POLICY "Authenticated read app settings" ON "public"."app_settings" FOR SELECT TO "authenticated" USING (true);
+
+
+
 CREATE POLICY "Insert holidays for self or managed worker" ON "public"."holidays" FOR INSERT TO "authenticated" WITH CHECK ((("user_id" = "auth"."uid"()) OR "public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("user_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id")))));
+
+
+
+CREATE POLICY "No direct client access" ON "public"."password_recovery_tokens" TO "authenticated", "anon" USING (false) WITH CHECK (false);
 
 
 
@@ -2640,6 +2909,9 @@ CREATE POLICY "Staff oversight view holidays" ON "public"."holidays" FOR SELECT 
 
 CREATE POLICY "Users view own holidays" ON "public"."holidays" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
 
+
+
+ALTER TABLE "public"."app_settings" ENABLE ROW LEVEL SECURITY;
 
 
 CREATE POLICY "assignments admin write" ON "public"."project_assignments" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
@@ -2678,7 +2950,7 @@ ALTER TABLE "public"."cost_company_domain_aliases" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."cost_company_subcontractors" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "cost_company_subcontractors admin all" ON "public"."cost_company_subcontractors" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "cost_company_subcontractors admin all" ON "public"."cost_company_subcontractors" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
 
 
 
@@ -2688,7 +2960,7 @@ ALTER TABLE "public"."cost_dated_scans" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."cost_invoice_splits" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "cost_invoice_splits admin all" ON "public"."cost_invoice_splits" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "cost_invoice_splits admin all" ON "public"."cost_invoice_splits" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
 
 
 
@@ -2833,6 +3105,15 @@ ALTER TABLE "public"."havs_tools" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."holidays" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."integration_email_accounts" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."integration_oauth_providers" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."integration_storage_backends" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."invoice_clients" ENABLE ROW LEVEL SECURITY;
 
 
@@ -2855,6 +3136,9 @@ CREATE POLICY "invoices admin all" ON "public"."invoices" TO "authenticated" USI
 
 
 ALTER TABLE "public"."nas_sync_queue" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."password_recovery_tokens" ENABLE ROW LEVEL SECURITY;
 
 
 CREATE POLICY "photos manage by parent manager" ON "public"."submission_photos" TO "authenticated" USING ("public"."can_manage_submission"("public"."submission_owner"("kind", "submission_id"))) WITH CHECK ("public"."can_manage_submission"("public"."submission_owner"("kind", "submission_id")));
@@ -3025,6 +3309,18 @@ CREATE POLICY "subcontractors read" ON "public"."subcontractors" FOR SELECT TO "
 
 
 ALTER TABLE "public"."submission_photos" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "super_admin manage email accounts" ON "public"."integration_email_accounts" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "super_admin manage oauth providers" ON "public"."integration_oauth_providers" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "super_admin manage storage backends" ON "public"."integration_storage_backends" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"));
+
 
 
 CREATE POLICY "tbx admin delete" ON "public"."toolbox_talks" FOR DELETE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
@@ -3497,6 +3793,12 @@ GRANT ALL ON FUNCTION "public"."daily_briefing_autoapprove"() TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "public"."delete_integration_secret"("p_name" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."delete_integration_secret"("p_name" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_integration_secret"("p_name" "text") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."email_domain"("p_from" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."email_domain"("p_from" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."email_domain"("p_from" "text") TO "service_role";
@@ -3505,6 +3807,11 @@ GRANT ALL ON FUNCTION "public"."email_domain"("p_from" "text") TO "service_role"
 
 REVOKE ALL ON FUNCTION "public"."force_approved_status"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."force_approved_status"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."get_integration_secret"("p_name" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_integration_secret"("p_name" "text") TO "service_role";
 
 
 
@@ -3600,6 +3907,12 @@ GRANT ALL ON FUNCTION "public"."rls_auto_enable"() TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "public"."set_integration_secret"("p_name" "text", "p_value" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."set_integration_secret"("p_name" "text", "p_value" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_integration_secret"("p_name" "text", "p_value" "text") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."set_updated_at"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."set_updated_at"() TO "service_role";
 
@@ -3670,6 +3983,12 @@ GRANT ALL ON FUNCTION "public"."user_subcontractor"("_user_id" "uuid") TO "servi
 
 
 
+GRANT ALL ON TABLE "public"."app_settings" TO "anon";
+GRANT ALL ON TABLE "public"."app_settings" TO "authenticated";
+GRANT ALL ON TABLE "public"."app_settings" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."clients" TO "anon";
 GRANT ALL ON TABLE "public"."clients" TO "authenticated";
 GRANT ALL ON TABLE "public"."clients" TO "service_role";
@@ -3721,6 +4040,12 @@ GRANT ALL ON TABLE "public"."cost_scan_skips" TO "service_role";
 GRANT ALL ON TABLE "public"."cost_scan_state" TO "anon";
 GRANT ALL ON TABLE "public"."cost_scan_state" TO "authenticated";
 GRANT ALL ON TABLE "public"."cost_scan_state" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."cost_scan_state_id_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."cost_scan_state_id_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."cost_scan_state_id_seq" TO "service_role";
 
 
 
@@ -3784,6 +4109,24 @@ GRANT ALL ON TABLE "public"."holidays" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."integration_email_accounts" TO "anon";
+GRANT ALL ON TABLE "public"."integration_email_accounts" TO "authenticated";
+GRANT ALL ON TABLE "public"."integration_email_accounts" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."integration_oauth_providers" TO "anon";
+GRANT ALL ON TABLE "public"."integration_oauth_providers" TO "authenticated";
+GRANT ALL ON TABLE "public"."integration_oauth_providers" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."integration_storage_backends" TO "anon";
+GRANT ALL ON TABLE "public"."integration_storage_backends" TO "authenticated";
+GRANT ALL ON TABLE "public"."integration_storage_backends" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."invoice_clients" TO "anon";
 GRANT ALL ON TABLE "public"."invoice_clients" TO "authenticated";
 GRANT ALL ON TABLE "public"."invoice_clients" TO "service_role";
@@ -3808,6 +4151,12 @@ GRANT ALL ON TABLE "public"."nas_sync_queue" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."password_recovery_tokens" TO "anon";
+GRANT ALL ON TABLE "public"."password_recovery_tokens" TO "authenticated";
+GRANT ALL ON TABLE "public"."password_recovery_tokens" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."plant" TO "anon";
 GRANT ALL ON TABLE "public"."plant" TO "authenticated";
 GRANT ALL ON TABLE "public"."plant" TO "service_role";
@@ -3826,9 +4175,54 @@ GRANT ALL ON TABLE "public"."plant_inspections" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."profiles" TO "anon";
-GRANT ALL ON TABLE "public"."profiles" TO "authenticated";
+GRANT INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,MAINTAIN,UPDATE ON TABLE "public"."profiles" TO "anon";
+GRANT INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,MAINTAIN,UPDATE ON TABLE "public"."profiles" TO "authenticated";
 GRANT ALL ON TABLE "public"."profiles" TO "service_role";
+
+
+
+GRANT SELECT("id") ON TABLE "public"."profiles" TO "anon";
+GRANT SELECT("id") ON TABLE "public"."profiles" TO "authenticated";
+
+
+
+GRANT SELECT("username") ON TABLE "public"."profiles" TO "anon";
+GRANT SELECT("username") ON TABLE "public"."profiles" TO "authenticated";
+
+
+
+GRANT SELECT("full_name") ON TABLE "public"."profiles" TO "anon";
+GRANT SELECT("full_name") ON TABLE "public"."profiles" TO "authenticated";
+
+
+
+GRANT SELECT("active") ON TABLE "public"."profiles" TO "anon";
+GRANT SELECT("active") ON TABLE "public"."profiles" TO "authenticated";
+
+
+
+GRANT SELECT("created_at") ON TABLE "public"."profiles" TO "anon";
+GRANT SELECT("created_at") ON TABLE "public"."profiles" TO "authenticated";
+
+
+
+GRANT SELECT("subcontractor_id") ON TABLE "public"."profiles" TO "anon";
+GRANT SELECT("subcontractor_id") ON TABLE "public"."profiles" TO "authenticated";
+
+
+
+GRANT SELECT("must_reset_password") ON TABLE "public"."profiles" TO "anon";
+GRANT SELECT("must_reset_password") ON TABLE "public"."profiles" TO "authenticated";
+
+
+
+GRANT SELECT("last_active_at") ON TABLE "public"."profiles" TO "anon";
+GRANT SELECT("last_active_at") ON TABLE "public"."profiles" TO "authenticated";
+
+
+
+GRANT SELECT("mfa_enabled") ON TABLE "public"."profiles" TO "anon";
+GRANT SELECT("mfa_enabled") ON TABLE "public"."profiles" TO "authenticated";
 
 
 
