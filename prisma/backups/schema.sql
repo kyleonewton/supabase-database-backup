@@ -286,13 +286,17 @@ ALTER FUNCTION "public"."continue_cost_scan"("p_url" "text", "p_apikey" "text") 
 
 CREATE OR REPLACE FUNCTION "public"."cost_invoices_apply_canonical_company"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public'
+    SET "search_path" TO 'public', 'extensions'
     AS $$
 BEGIN
   IF NEW.company_name IS NOT NULL
      AND btrim(NEW.company_name) <> ''
      AND upper(btrim(NEW.company_name)) <> 'NA' THEN
-    NEW.company_name := public.resolve_cost_company_canonical(NEW.company_name);
+    NEW.company_name := public.resolve_cost_company_for_invoice(
+      NEW.company_name,
+      NEW.source_email_from,
+      NEW.invoice_number
+    );
   END IF;
   RETURN NEW;
 END;
@@ -557,6 +561,34 @@ $$;
 ALTER FUNCTION "public"."holidays_enforce_status_change"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."holidays_prevent_overlap"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF NEW.user_id IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM public.holidays h
+    WHERE h.user_id = NEW.user_id
+      AND h.status IN ('pending', 'approved')
+      AND h.id IS DISTINCT FROM NEW.id
+      AND h.start_date <= NEW.end_date
+      AND h.end_date >= NEW.start_date
+  ) THEN
+    RAISE EXCEPTION 'Holiday dates overlap an existing booking for this user';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."holidays_prevent_overlap"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."invoices_before_insert"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -617,6 +649,17 @@ $$;
 
 
 ALTER FUNCTION "public"."is_generic_email_domain"("p_domain" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."is_legal_entity_name"("p_name" "text") RETURNS boolean
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT coalesce(p_name, '') ~* '\m(ltd|limited|plc|llp)\M'
+$$;
+
+
+ALTER FUNCTION "public"."is_legal_entity_name"("p_name" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."is_shared_invoice_portal_domain"("p_domain" "text") RETURNS boolean
@@ -719,6 +762,40 @@ $$;
 ALTER FUNCTION "public"."owns_submission"("_kind" "public"."submission_kind", "_submission_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."pick_domain_canonical"("p_domain" "text") RETURNS "text"
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_canon text;
+BEGIN
+  SELECT d.canonical_name
+    INTO v_canon
+    FROM public.cost_company_domain_aliases d
+    LEFT JOIN (
+      SELECT ci.company_name, count(*) AS cnt
+        FROM public.cost_invoices ci
+       WHERE public.email_domain(ci.source_email_from) = p_domain
+         AND ci.company_name IS NOT NULL
+         AND btrim(ci.company_name) <> ''
+         AND upper(btrim(ci.company_name)) <> 'NA'
+       GROUP BY ci.company_name
+    ) inv ON inv.company_name = d.canonical_name
+   WHERE d.domain = p_domain
+   ORDER BY
+     CASE WHEN public.is_legal_entity_name(d.canonical_name) THEN 0 ELSE 1 END,
+     coalesce(inv.cnt, 0) DESC,
+     char_length(public.company_match_key(d.canonical_name)) DESC,
+     d.canonical_name ASC
+   LIMIT 1;
+  RETURN v_canon;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."pick_domain_canonical"("p_domain" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."profiles_guard_sensitive_self_update"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -736,6 +813,53 @@ $$;
 
 
 ALTER FUNCTION "public"."profiles_guard_sensitive_self_update"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."resolve_company_from_invoice_series"("p_from" "text", "p_invoice_number" "text") RETURNS "text"
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $_$
+DECLARE
+  v_domain text;
+  v_num text;
+  v_prefix text;
+  v_canon text;
+BEGIN
+  v_domain := public.email_domain(p_from);
+  IF v_domain IS NULL OR v_domain = ''
+     OR public.is_generic_email_domain(v_domain)
+     OR public.is_shared_invoice_portal_domain(v_domain) THEN
+    RETURN NULL;
+  END IF;
+
+  v_num := upper(regexp_replace(coalesce(p_invoice_number, ''), '[^A-Z0-9]', '', 'g'));
+  IF v_num = '' OR length(v_num) < 5 THEN
+    RETURN NULL;
+  END IF;
+
+  IF v_num ~ '^\d+$' THEN
+    v_prefix := left(v_num, 3);
+    SELECT ci.company_name
+      INTO v_canon
+      FROM public.cost_invoices ci
+     WHERE public.email_domain(ci.source_email_from) = v_domain
+       AND ci.company_name IS NOT NULL
+       AND btrim(ci.company_name) <> ''
+       AND upper(btrim(ci.company_name)) <> 'NA'
+       AND ci.invoice_number_key IS NOT NULL
+       AND left(ci.invoice_number_key, 3) = v_prefix
+     GROUP BY ci.company_name
+     ORDER BY count(*) DESC, max(ci.created_at) DESC
+     LIMIT 1;
+    RETURN v_canon;
+  END IF;
+
+  RETURN NULL;
+END;
+$_$;
+
+
+ALTER FUNCTION "public"."resolve_company_from_invoice_series"("p_from" "text", "p_invoice_number" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."resolve_cost_company_canonical"("p_name" "text") RETURNS "text"
@@ -842,6 +966,88 @@ $$;
 
 
 ALTER FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text", "p_invoice_number" "text" DEFAULT NULL::"text") RETURNS "text"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'extensions'
+    AS $$
+DECLARE
+  v_domain text;
+  v_count int;
+  v_canon text;
+  v_resolved text;
+  v_trusted boolean;
+  v_key text;
+  v_brand_canon text;
+  v_series_canon text;
+BEGIN
+  v_domain := public.email_domain(p_from);
+  v_trusted := v_domain IS NOT NULL AND v_domain <> ''
+    AND NOT public.is_generic_email_domain(v_domain)
+    AND NOT public.is_shared_invoice_portal_domain(v_domain);
+
+  IF v_trusted THEN
+    SELECT count(DISTINCT canonical_name)
+      INTO v_count
+      FROM public.cost_company_domain_aliases
+      WHERE domain = v_domain;
+
+    IF v_count = 1 THEN
+      SELECT min(canonical_name) INTO v_canon
+        FROM public.cost_company_domain_aliases
+       WHERE domain = v_domain;
+      RETURN public.resolve_cost_company_canonical(v_canon);
+    ELSIF v_count > 1 THEN
+      v_canon := public.pick_domain_canonical(v_domain);
+      IF v_canon IS NOT NULL THEN
+        RETURN public.resolve_cost_company_canonical(v_canon);
+      END IF;
+    END IF;
+  END IF;
+
+  IF p_name IS NOT NULL AND btrim(p_name) <> '' AND upper(btrim(p_name)) <> 'NA' THEN
+    v_key := public.company_match_key(p_name);
+    IF v_key IS NOT NULL AND v_key <> '' THEN
+      SELECT canonical_name INTO v_brand_canon
+        FROM public.cost_company_brand_aliases
+       WHERE brand_key = v_key;
+      IF v_brand_canon IS NOT NULL THEN
+        RETURN public.resolve_cost_company_canonical(v_brand_canon);
+      END IF;
+    END IF;
+  END IF;
+
+  IF p_invoice_number IS NOT NULL AND btrim(p_invoice_number) <> '' THEN
+    v_series_canon := public.resolve_company_from_invoice_series(p_from, p_invoice_number);
+    IF v_series_canon IS NOT NULL THEN
+      RETURN public.resolve_cost_company_canonical(v_series_canon);
+    END IF;
+  END IF;
+
+  v_resolved := public.resolve_cost_company_canonical(p_name);
+
+  IF v_trusted AND v_resolved IS NOT NULL
+     AND btrim(v_resolved) <> '' AND upper(btrim(v_resolved)) <> 'NA' THEN
+    INSERT INTO public.cost_company_domain_aliases (domain, canonical_name)
+    VALUES (v_domain, btrim(v_resolved))
+    ON CONFLICT (domain, canonical_name) DO NOTHING;
+
+    IF p_name IS NOT NULL AND btrim(p_name) <> '' AND upper(btrim(p_name)) <> 'NA'
+       AND NOT public.is_legal_entity_name(p_name)
+       AND public.company_match_key(p_name) <> public.company_match_key(v_resolved) THEN
+      INSERT INTO public.cost_company_brand_aliases (brand_key, canonical_name)
+      VALUES (public.company_match_key(p_name), btrim(v_resolved))
+      ON CONFLICT (brand_key) DO UPDATE SET canonical_name = EXCLUDED.canonical_name;
+    END IF;
+  END IF;
+
+  RETURN v_resolved;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text", "p_invoice_number" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."rls_auto_enable"() RETURNS "event_trigger"
@@ -1118,6 +1324,17 @@ CREATE TABLE IF NOT EXISTS "public"."cost_company_aliases" (
 ALTER TABLE "public"."cost_company_aliases" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."cost_company_brand_aliases" (
+    "brand_key" "text" NOT NULL,
+    "canonical_name" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."cost_company_brand_aliases" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."cost_company_domain_aliases" (
     "domain" "text" NOT NULL,
     "canonical_name" "text" NOT NULL,
@@ -1260,7 +1477,8 @@ CREATE TABLE IF NOT EXISTS "public"."cost_scan_state" (
     "scan_lock_at" timestamp with time zone,
     "scan_cursor_uid" bigint,
     "stop_requested" boolean DEFAULT false NOT NULL,
-    "account_id" "uuid"
+    "account_id" "uuid",
+    "scan_paused" boolean DEFAULT false NOT NULL
 );
 
 
@@ -1922,6 +2140,11 @@ ALTER TABLE ONLY "public"."cost_company_aliases"
 
 
 
+ALTER TABLE ONLY "public"."cost_company_brand_aliases"
+    ADD CONSTRAINT "cost_company_brand_aliases_pkey" PRIMARY KEY ("brand_key");
+
+
+
 ALTER TABLE ONLY "public"."cost_company_domain_aliases"
     ADD CONSTRAINT "cost_company_domain_aliases_pkey" PRIMARY KEY ("domain", "canonical_name");
 
@@ -2416,7 +2639,15 @@ CREATE OR REPLACE TRIGGER "holidays_before_insert_autoapprove" BEFORE INSERT ON 
 
 
 
+CREATE OR REPLACE TRIGGER "holidays_before_insert_overlap" BEFORE INSERT ON "public"."holidays" FOR EACH ROW EXECUTE FUNCTION "public"."holidays_prevent_overlap"();
+
+
+
 CREATE OR REPLACE TRIGGER "holidays_before_update_amend_resets_status" BEFORE UPDATE OF "start_date", "end_date", "note" ON "public"."holidays" FOR EACH ROW EXECUTE FUNCTION "public"."holidays_amend_resets_status"();
+
+
+
+CREATE OR REPLACE TRIGGER "holidays_before_update_overlap" BEFORE UPDATE OF "start_date", "end_date", "user_id", "status" ON "public"."holidays" FOR EACH ROW EXECUTE FUNCTION "public"."holidays_prevent_overlap"();
 
 
 
@@ -2433,6 +2664,10 @@ CREATE OR REPLACE TRIGGER "profiles_guard_sensitive_self_update" BEFORE UPDATE O
 
 
 CREATE OR REPLACE TRIGGER "set_cost_company_aliases_updated_at" BEFORE UPDATE ON "public"."cost_company_aliases" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "set_cost_company_brand_aliases_updated_at" BEFORE UPDATE ON "public"."cost_company_brand_aliases" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
 
 
 
@@ -2843,6 +3078,10 @@ CREATE POLICY "Admins manage cost company aliases" ON "public"."cost_company_ali
 
 
 
+CREATE POLICY "Admins manage cost company brand aliases" ON "public"."cost_company_brand_aliases" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+
+
+
 CREATE POLICY "Admins manage cost company domain aliases" ON "public"."cost_company_domain_aliases" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
 
 
@@ -2942,6 +3181,9 @@ CREATE POLICY "clients read authed" ON "public"."clients" FOR SELECT TO "authent
 
 
 ALTER TABLE "public"."cost_company_aliases" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."cost_company_brand_aliases" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."cost_company_domain_aliases" ENABLE ROW LEVEL SECURITY;
@@ -3846,6 +4088,11 @@ GRANT ALL ON FUNCTION "public"."holidays_enforce_status_change"() TO "service_ro
 
 
 
+REVOKE ALL ON FUNCTION "public"."holidays_prevent_overlap"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."holidays_prevent_overlap"() TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."invoices_before_insert"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."invoices_before_insert"() TO "service_role";
 
@@ -3860,6 +4107,12 @@ GRANT ALL ON FUNCTION "public"."is_assigned_to_project"("_user_id" "uuid", "_pro
 GRANT ALL ON FUNCTION "public"."is_generic_email_domain"("p_domain" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."is_generic_email_domain"("p_domain" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_generic_email_domain"("p_domain" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."is_legal_entity_name"("p_name" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."is_legal_entity_name"("p_name" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_legal_entity_name"("p_name" "text") TO "service_role";
 
 
 
@@ -3886,8 +4139,20 @@ GRANT ALL ON FUNCTION "public"."owns_submission"("_kind" "public"."submission_ki
 
 
 
+GRANT ALL ON FUNCTION "public"."pick_domain_canonical"("p_domain" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."pick_domain_canonical"("p_domain" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."pick_domain_canonical"("p_domain" "text") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."profiles_guard_sensitive_self_update"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."profiles_guard_sensitive_self_update"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."resolve_company_from_invoice_series"("p_from" "text", "p_invoice_number" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."resolve_company_from_invoice_series"("p_from" "text", "p_invoice_number" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."resolve_company_from_invoice_series"("p_from" "text", "p_invoice_number" "text") TO "service_role";
 
 
 
@@ -3899,6 +4164,12 @@ GRANT ALL ON FUNCTION "public"."resolve_cost_company_canonical"("p_name" "text")
 REVOKE ALL ON FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text", "p_invoice_number" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text", "p_invoice_number" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text", "p_invoice_number" "text") TO "service_role";
 
 
 
@@ -3998,6 +4269,12 @@ GRANT ALL ON TABLE "public"."clients" TO "service_role";
 GRANT ALL ON TABLE "public"."cost_company_aliases" TO "anon";
 GRANT ALL ON TABLE "public"."cost_company_aliases" TO "authenticated";
 GRANT ALL ON TABLE "public"."cost_company_aliases" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."cost_company_brand_aliases" TO "anon";
+GRANT ALL ON TABLE "public"."cost_company_brand_aliases" TO "authenticated";
+GRANT ALL ON TABLE "public"."cost_company_brand_aliases" TO "service_role";
 
 
 
