@@ -216,6 +216,40 @@ $$;
 ALTER FUNCTION "public"."can_access_submission"("_kind" "public"."submission_kind", "_submission_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."can_access_todo_item"("_user_id" "uuid", "_item_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.todo_items ti
+    WHERE ti.id = _item_id
+      AND public.can_access_todo_list(_user_id, ti.list_id)
+  )
+$$;
+
+
+ALTER FUNCTION "public"."can_access_todo_item"("_user_id" "uuid", "_item_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."can_access_todo_list"("_user_id" "uuid", "_list_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT public.has_role(_user_id, 'admin'::app_role)
+  OR public.has_role(_user_id, 'cjb_manager'::app_role)
+  OR (
+    EXISTS (
+      SELECT 1 FROM public.todo_lists
+      WHERE id = _list_id AND archived_at IS NULL
+    )
+    AND public.is_assigned_to_todo_list(_user_id, _list_id)
+  )
+$$;
+
+
+ALTER FUNCTION "public"."can_access_todo_list"("_user_id" "uuid", "_list_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."can_manage_submission"("_worker_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -232,6 +266,35 @@ $$;
 
 
 ALTER FUNCTION "public"."can_manage_submission"("_worker_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."can_modify_todo_item"("_user_id" "uuid", "_item_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.todo_items ti
+    WHERE ti.id = _item_id
+      AND public.can_access_todo_list(_user_id, ti.list_id)
+      AND (
+        public.has_role(_user_id, 'admin'::app_role)
+        OR (
+          public.has_role(_user_id, 'worker'::app_role)
+          AND ti.created_by = _user_id
+        )
+        OR (
+          public.has_role(_user_id, 'manager'::app_role)
+          AND public.user_subcontractor(_user_id) IS NOT NULL
+          AND ti.created_by IS NOT NULL
+          AND public.user_subcontractor(_user_id) = public.user_subcontractor(ti.created_by)
+        )
+      )
+  )
+$$;
+
+
+ALTER FUNCTION "public"."can_modify_todo_item"("_user_id" "uuid", "_item_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."company_match_key"("p_name" "text") RETURNS "text"
@@ -286,21 +349,19 @@ ALTER FUNCTION "public"."continue_cost_scan"("p_url" "text", "p_apikey" "text") 
 
 CREATE OR REPLACE FUNCTION "public"."cost_invoices_apply_canonical_company"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public', 'extensions'
+    SET "search_path" TO 'public'
     AS $$
+DECLARE v_supplier_id uuid; v_canonical text;
 BEGIN
-  IF NEW.company_name IS NOT NULL
-     AND btrim(NEW.company_name) <> ''
-     AND upper(btrim(NEW.company_name)) <> 'NA' THEN
-    NEW.company_name := public.resolve_cost_company_for_invoice(
-      NEW.company_name,
-      NEW.source_email_from,
-      NEW.invoice_number
-    );
+  NEW.supplier_email_domain := public.trusted_supplier_email_domain(NEW.source_email_from);
+  NEW.invoice_format_key := public.invoice_format_key(NEW.invoice_number);
+  IF NEW.company_name IS NOT NULL AND btrim(NEW.company_name) <> '' AND upper(btrim(NEW.company_name)) <> 'NA' THEN
+    SELECT r.supplier_id, r.canonical_name INTO v_supplier_id, v_canonical FROM public.resolve_cost_supplier_for_invoice(NEW.supplier_vat_number, NEW.supplier_company_reg_number, NEW.company_name, NEW.source_email_from, NEW.invoice_number, NEW.id) r LIMIT 1;
+    IF v_canonical IS NOT NULL THEN NEW.company_name := v_canonical; NEW.supplier_id := v_supplier_id;
+    ELSE NEW.company_name := public.resolve_cost_company_for_invoice(NEW.company_name, NEW.source_email_from, NEW.invoice_number); END IF;
   END IF;
   RETURN NEW;
-END;
-$$;
+END; $$;
 
 
 ALTER FUNCTION "public"."cost_invoices_apply_canonical_company"() OWNER TO "postgres";
@@ -349,6 +410,31 @@ $_$;
 ALTER FUNCTION "public"."email_domain"("p_from" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."find_or_create_cost_supplier"("p_canonical_name" "text") RETURNS "uuid"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE v_name text; v_key text; v_id uuid;
+BEGIN
+  v_name := btrim(coalesce(p_canonical_name, ''));
+  IF v_name = '' OR upper(v_name) = 'NA' THEN RETURN NULL; END IF;
+  SELECT id INTO v_id FROM public.cost_suppliers WHERE canonical_name = v_name LIMIT 1;
+  IF v_id IS NOT NULL THEN RETURN v_id; END IF;
+  v_key := public.company_match_key(v_name);
+  IF v_key IS NOT NULL AND v_key <> '' THEN
+    SELECT cs.id INTO v_id FROM public.cost_suppliers cs WHERE public.company_match_key(cs.canonical_name) = v_key ORDER BY cs.created_at ASC LIMIT 1;
+    IF v_id IS NOT NULL THEN RETURN v_id; END IF;
+  END IF;
+  INSERT INTO public.cost_suppliers (canonical_name) VALUES (v_name) ON CONFLICT (canonical_name) DO NOTHING RETURNING id INTO v_id;
+  IF v_id IS NULL THEN SELECT id INTO v_id FROM public.cost_suppliers WHERE canonical_name = v_name LIMIT 1; END IF;
+  RETURN v_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."find_or_create_cost_supplier"("p_canonical_name" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."force_approved_status"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -390,37 +476,39 @@ CREATE OR REPLACE FUNCTION "public"."handle_new_user"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-declare
+DECLARE
   v_username text;
   v_full_name text;
   v_other_count int;
-begin
+BEGIN
   v_username := coalesce(new.raw_user_meta_data->>'username', split_part(new.email,'@',1));
   v_full_name := coalesce(new.raw_user_meta_data->>'full_name', v_username);
-  insert into public.profiles (id, username, full_name)
-  values (new.id, v_username, v_full_name)
-  on conflict (id) do nothing;
-  insert into public.user_roles (user_id, role) values (new.id, 'worker')
-  on conflict do nothing;
+  INSERT INTO public.profiles (id, username, full_name)
+  VALUES (new.id, v_username, v_full_name)
+  ON CONFLICT (id) DO NOTHING;
+  INSERT INTO public.user_roles (user_id, role) VALUES (new.id, 'worker')
+  ON CONFLICT DO NOTHING;
+  INSERT INTO public.notification_preferences (user_id)
+  VALUES (new.id)
+  ON CONFLICT (user_id) DO NOTHING;
 
-  -- Auto-assign new user to every project where all other existing users are already assigned.
-  select count(*) into v_other_count from public.profiles where id <> new.id;
-  if v_other_count > 0 then
-    insert into public.project_assignments (project_id, user_id, assigned_by)
-    select p.id, new.id, null
-    from public.projects p
-    where p.archived_at is null
-      and (
-        select count(distinct pa.user_id)
-        from public.project_assignments pa
-        where pa.project_id = p.id
-          and pa.user_id <> new.id
+  SELECT count(*) INTO v_other_count FROM public.profiles WHERE id <> new.id;
+  IF v_other_count > 0 THEN
+    INSERT INTO public.project_assignments (project_id, user_id, assigned_by)
+    SELECT p.id, new.id, null
+    FROM public.projects p
+    WHERE p.archived_at IS NULL
+      AND (
+        SELECT count(distinct pa.user_id)
+        FROM public.project_assignments pa
+        WHERE pa.project_id = p.id
+          AND pa.user_id <> new.id
       ) >= v_other_count
-    on conflict (project_id, user_id) do nothing;
-  end if;
+    ON CONFLICT (project_id, user_id) DO NOTHING;
+  END IF;
 
-  return new;
-end;
+  RETURN new;
+END;
 $$;
 
 
@@ -589,6 +677,26 @@ $$;
 ALTER FUNCTION "public"."holidays_prevent_overlap"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."invoice_format_key"("p_invoice_number" "text") RETURNS "text"
+    LANGUAGE "plpgsql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $_$
+DECLARE v_norm text; v_alpha text;
+BEGIN
+  v_norm := upper(regexp_replace(coalesce(p_invoice_number, ''), '[^A-Z0-9]', '', 'g'));
+  IF v_norm = '' OR v_norm IN ('NA', 'N/A', 'NONUMBER', 'NO_NUMBER') THEN RETURN NULL; END IF;
+  IF v_norm ~ '^\d+$' AND length(v_norm) >= 5 THEN
+    RETURN 'NUM:' || length(v_norm)::text || '-' || left(v_norm, 3);
+  END IF;
+  v_alpha := upper(substring(v_norm from '^([A-Z]+)'));
+  IF v_alpha IS NOT NULL AND length(v_alpha) >= 2 THEN RETURN 'ALPHA:' || v_alpha; END IF;
+  RETURN NULL;
+END; $_$;
+
+
+ALTER FUNCTION "public"."invoice_format_key"("p_invoice_number" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."invoices_before_insert"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -634,6 +742,20 @@ $$;
 
 
 ALTER FUNCTION "public"."is_assigned_to_project"("_user_id" "uuid", "_project_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."is_assigned_to_todo_list"("_user_id" "uuid", "_list_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.todo_list_assignments
+    WHERE list_id = _list_id AND user_id = _user_id
+  )
+$$;
+
+
+ALTER FUNCTION "public"."is_assigned_to_todo_list"("_user_id" "uuid", "_list_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."is_generic_email_domain"("p_domain" "text") RETURNS boolean
@@ -696,6 +818,60 @@ $$;
 ALTER FUNCTION "public"."is_staff"("_user_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") RETURNS boolean
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_domain text;
+  v_config text;
+  v_entry text;
+BEGIN
+  v_domain := lower(btrim(coalesce(p_domain, '')));
+  IF v_domain = '' THEN RETURN false; END IF;
+  IF v_domain = 'cjbce.co.uk' OR v_domain LIKE '%.cjbce.co.uk' THEN RETURN true; END IF;
+  SELECT value INTO v_config FROM public.app_settings WHERE key = 'cost_relay_email_domains';
+  IF v_config IS NULL OR btrim(v_config) = '' THEN RETURN false; END IF;
+  FOR v_entry IN SELECT lower(btrim(jsonb_array_elements_text(v_config::jsonb))) LOOP
+    IF v_entry = '' THEN CONTINUE; END IF;
+    IF v_domain = v_entry OR v_domain LIKE '%.' || v_entry THEN RETURN true; END IF;
+  END LOOP;
+  RETURN false;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") RETURNS TABLE("supplier_id" "uuid", "canonical_name" "text")
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE v_key text;
+BEGIN
+  v_key := public.normalize_vat_number(p_vat);
+  IF v_key IS NOT NULL THEN
+    RETURN QUERY SELECT cs.id, cs.canonical_name FROM public.cost_supplier_identifiers csi JOIN public.cost_suppliers cs ON cs.id = csi.supplier_id WHERE csi.identifier_type = 'vat' AND csi.identifier_key = v_key LIMIT 1;
+    IF FOUND THEN RETURN; END IF;
+  END IF;
+  v_key := public.normalize_company_registration(p_company_reg);
+  IF v_key IS NOT NULL THEN
+    RETURN QUERY SELECT cs.id, cs.canonical_name FROM public.cost_supplier_identifiers csi JOIN public.cost_suppliers cs ON cs.id = csi.supplier_id WHERE csi.identifier_type = 'company_registration' AND csi.identifier_key = v_key LIMIT 1;
+    IF FOUND THEN RETURN; END IF;
+  END IF;
+  IF p_name IS NOT NULL AND btrim(p_name) <> '' AND upper(btrim(p_name)) <> 'NA' THEN
+    v_key := public.supplier_legal_name_key(p_name);
+    IF v_key IS NOT NULL THEN
+      RETURN QUERY SELECT cs.id, cs.canonical_name FROM public.cost_supplier_identifiers csi JOIN public.cost_suppliers cs ON cs.id = csi.supplier_id WHERE csi.identifier_type = 'legal_name' AND csi.identifier_key = v_key LIMIT 1;
+    END IF;
+  END IF;
+END; $$;
+
+
+ALTER FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."match_subcontractor_by_company"("p_company" "text") RETURNS "uuid"
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public', 'extensions'
@@ -740,6 +916,59 @@ $$;
 
 
 ALTER FUNCTION "public"."match_subcontractor_by_company"("p_company" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."most_common_cost_company_name"("p_match_key" "text") RETURNS "text"
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT ci.company_name FROM public.cost_invoices ci
+   WHERE p_match_key IS NOT NULL AND p_match_key <> ''
+     AND public.company_match_key(ci.company_name) = p_match_key
+     AND ci.company_name IS NOT NULL AND btrim(ci.company_name) <> ''
+     AND upper(btrim(ci.company_name)) <> 'NA'
+   GROUP BY ci.company_name
+   ORDER BY count(*) DESC, max(ci.created_at) DESC LIMIT 1
+$$;
+
+
+ALTER FUNCTION "public"."most_common_cost_company_name"("p_match_key" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."normalize_company_registration"("p_reg" "text") RETURNS "text"
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT NULLIF(upper(regexp_replace(btrim(coalesce(p_reg, '')), '[^A-Z0-9]', '', 'g')), '')
+$$;
+
+
+ALTER FUNCTION "public"."normalize_company_registration"("p_reg" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."normalize_vat_number"("p_vat" "text") RETURNS "text"
+    LANGUAGE "plpgsql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v text;
+BEGIN
+  IF p_vat IS NULL OR btrim(p_vat) = '' THEN
+    RETURN NULL;
+  END IF;
+  v := upper(regexp_replace(btrim(p_vat), '[^A-Z0-9]', '', 'g'));
+  IF v = '' THEN
+    RETURN NULL;
+  END IF;
+  IF v LIKE 'GB%' AND length(v) > 2 THEN
+    v := substring(v from 3);
+  END IF;
+  RETURN NULLIF(v, '');
+END;
+$$;
+
+
+ALTER FUNCTION "public"."normalize_vat_number"("p_vat" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."owns_submission"("_kind" "public"."submission_kind", "_submission_id" "uuid") RETURNS boolean
@@ -815,6 +1044,53 @@ $$;
 ALTER FUNCTION "public"."profiles_guard_sensitive_self_update"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."resolve_company_from_costs_table"("p_domain" "text", "p_format_key" "text", "p_pdf_name" "text" DEFAULT NULL::"text") RETURNS "text"
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE v_pdf_key text; v_resolved text; v_total bigint; v_winner_cnt bigint; v_winner_name text; v_distinct int;
+BEGIN
+  IF p_pdf_name IS NOT NULL AND btrim(p_pdf_name) <> '' AND upper(btrim(p_pdf_name)) <> 'NA' THEN
+    v_pdf_key := public.company_match_key(p_pdf_name);
+    IF v_pdf_key IS NOT NULL AND v_pdf_key <> '' THEN
+      v_resolved := public.most_common_cost_company_name(v_pdf_key);
+      IF v_resolved IS NOT NULL THEN RETURN v_resolved; END IF;
+    END IF;
+  END IF;
+  IF p_domain IS NOT NULL AND btrim(p_domain) <> '' AND p_format_key IS NOT NULL AND btrim(p_format_key) <> '' THEN
+    SELECT ci.company_name INTO v_resolved FROM public.cost_invoices ci
+     WHERE ci.supplier_email_domain = p_domain AND ci.invoice_format_key = p_format_key
+       AND ci.company_name IS NOT NULL AND btrim(ci.company_name) <> '' AND upper(btrim(ci.company_name)) <> 'NA'
+     GROUP BY ci.company_name ORDER BY count(*) DESC, max(ci.created_at) DESC LIMIT 1;
+    IF v_resolved IS NOT NULL THEN RETURN v_resolved; END IF;
+  END IF;
+  IF p_format_key IS NOT NULL AND btrim(p_format_key) <> '' THEN
+    SELECT count(*)::bigint, count(DISTINCT ci.company_name)::int INTO v_total, v_distinct
+      FROM public.cost_invoices ci
+     WHERE ci.invoice_format_key = p_format_key AND ci.supplier_email_domain IS NOT NULL
+       AND ci.company_name IS NOT NULL AND btrim(ci.company_name) <> '' AND upper(btrim(ci.company_name)) <> 'NA';
+    IF v_total >= 2 THEN
+      SELECT ci.company_name, count(*)::bigint INTO v_winner_name, v_winner_cnt
+        FROM public.cost_invoices ci
+       WHERE ci.invoice_format_key = p_format_key AND ci.supplier_email_domain IS NOT NULL
+         AND ci.company_name IS NOT NULL AND btrim(ci.company_name) <> '' AND upper(btrim(ci.company_name)) <> 'NA'
+       GROUP BY ci.company_name ORDER BY count(*) DESC, max(ci.created_at) DESC LIMIT 1;
+      IF v_winner_name IS NOT NULL AND v_winner_cnt::numeric / v_total::numeric >= 0.8
+         AND (v_distinct = 1 OR v_winner_cnt = v_total) THEN
+        IF p_pdf_name IS NULL OR btrim(p_pdf_name) = '' OR upper(btrim(p_pdf_name)) = 'NA'
+           OR public.company_match_key(p_pdf_name) = public.company_match_key(v_winner_name) THEN
+          RETURN v_winner_name;
+        END IF;
+      END IF;
+    END IF;
+  END IF;
+  RETURN NULL;
+END; $$;
+
+
+ALTER FUNCTION "public"."resolve_company_from_costs_table"("p_domain" "text", "p_format_key" "text", "p_pdf_name" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."resolve_company_from_invoice_series"("p_from" "text", "p_invoice_number" "text") RETURNS "text"
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -864,53 +1140,24 @@ ALTER FUNCTION "public"."resolve_company_from_invoice_series"("p_from" "text", "
 
 CREATE OR REPLACE FUNCTION "public"."resolve_cost_company_canonical"("p_name" "text") RETURNS "text"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public', 'extensions'
+    SET "search_path" TO 'public'
     AS $$
-DECLARE
-  v_key text;
-  v_canon text;
-  v_match_canon text;
+DECLARE v_key text; v_canon text; v_table text;
 BEGIN
-  IF p_name IS NULL OR btrim(p_name) = '' OR upper(btrim(p_name)) = 'NA' THEN
-    RETURN p_name;
-  END IF;
+  IF p_name IS NULL OR btrim(p_name) = '' OR upper(btrim(p_name)) = 'NA' THEN RETURN p_name; END IF;
   v_key := public.company_match_key(p_name);
-  IF v_key IS NULL OR v_key = '' THEN
-    RETURN p_name;
-  END IF;
-
-  -- 1) Exact (normalised) key wins — fast path for known suppliers.
+  IF v_key IS NULL OR v_key = '' THEN RETURN btrim(p_name); END IF;
   SELECT canonical_name INTO v_canon FROM public.cost_company_aliases WHERE match_key = v_key;
-  IF v_canon IS NOT NULL THEN
-    RETURN v_canon;
+  IF v_canon IS NOT NULL THEN RETURN v_canon; END IF;
+  v_table := public.most_common_cost_company_name(v_key);
+  IF v_table IS NOT NULL THEN
+    INSERT INTO public.cost_company_aliases (match_key, canonical_name) VALUES (v_key, v_table) ON CONFLICT (match_key) DO NOTHING;
+    RETURN v_table;
   END IF;
-
-  -- 2) Fuzzy fallback: check the new name against every existing supplier and
-  --    reuse the closest one. The 0.62 threshold sits in the safe gap between
-  --    genuinely different suppliers (observed max ~0.51) and real spelling
-  --    variants of the same supplier (~0.72+).
-  SELECT canonical_name
-    INTO v_match_canon
-    FROM public.cost_company_aliases
-    WHERE similarity(match_key, v_key) >= 0.62
-    ORDER BY similarity(match_key, v_key) DESC, char_length(match_key) ASC
-    LIMIT 1;
-
-  IF v_match_canon IS NOT NULL THEN
-    INSERT INTO public.cost_company_aliases (match_key, canonical_name)
-    VALUES (v_key, v_match_canon)
-    ON CONFLICT (match_key) DO NOTHING;
-    RETURN v_match_canon;
-  END IF;
-
-  -- 3) No confident match: record as a new supplier (first name wins).
-  INSERT INTO public.cost_company_aliases (match_key, canonical_name)
-  VALUES (v_key, btrim(p_name))
-  ON CONFLICT (match_key) DO NOTHING;
+  INSERT INTO public.cost_company_aliases (match_key, canonical_name) VALUES (v_key, btrim(p_name)) ON CONFLICT (match_key) DO NOTHING;
   SELECT canonical_name INTO v_canon FROM public.cost_company_aliases WHERE match_key = v_key;
   RETURN coalesce(v_canon, btrim(p_name));
-END;
-$$;
+END; $$;
 
 
 ALTER FUNCTION "public"."resolve_cost_company_canonical"("p_name" "text") OWNER TO "postgres";
@@ -970,84 +1217,62 @@ ALTER FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_f
 
 CREATE OR REPLACE FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text", "p_invoice_number" "text" DEFAULT NULL::"text") RETURNS "text"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public', 'extensions'
+    SET "search_path" TO 'public'
     AS $$
-DECLARE
-  v_domain text;
-  v_count int;
-  v_canon text;
-  v_resolved text;
-  v_trusted boolean;
-  v_key text;
-  v_brand_canon text;
-  v_series_canon text;
+DECLARE v_domain text; v_format_key text; v_resolved text; v_has_pdf_name boolean; v_domain_only text; v_domain_cnt int;
 BEGIN
-  v_domain := public.email_domain(p_from);
-  v_trusted := v_domain IS NOT NULL AND v_domain <> ''
-    AND NOT public.is_generic_email_domain(v_domain)
-    AND NOT public.is_shared_invoice_portal_domain(v_domain);
-
-  IF v_trusted THEN
-    SELECT count(DISTINCT canonical_name)
-      INTO v_count
-      FROM public.cost_company_domain_aliases
-      WHERE domain = v_domain;
-
-    IF v_count = 1 THEN
-      SELECT min(canonical_name) INTO v_canon
-        FROM public.cost_company_domain_aliases
-       WHERE domain = v_domain;
-      RETURN public.resolve_cost_company_canonical(v_canon);
-    ELSIF v_count > 1 THEN
-      v_canon := public.pick_domain_canonical(v_domain);
-      IF v_canon IS NOT NULL THEN
-        RETURN public.resolve_cost_company_canonical(v_canon);
-      END IF;
+  v_domain := public.trusted_supplier_email_domain(p_from);
+  v_format_key := public.invoice_format_key(p_invoice_number);
+  v_has_pdf_name := p_name IS NOT NULL AND btrim(p_name) <> '' AND upper(btrim(p_name)) <> 'NA';
+  v_resolved := public.resolve_company_from_costs_table(v_domain, v_format_key, p_name);
+  IF v_resolved IS NOT NULL THEN RETURN v_resolved; END IF;
+  IF v_has_pdf_name THEN RETURN btrim(p_name); END IF;
+  IF v_domain IS NOT NULL THEN
+    SELECT count(DISTINCT ci.company_name) INTO v_domain_cnt FROM public.cost_invoices ci
+     WHERE ci.supplier_email_domain = v_domain AND ci.company_name IS NOT NULL
+       AND btrim(ci.company_name) <> '' AND upper(btrim(ci.company_name)) <> 'NA';
+    IF v_domain_cnt = 1 THEN
+      SELECT min(ci.company_name) INTO v_domain_only FROM public.cost_invoices ci
+       WHERE ci.supplier_email_domain = v_domain AND ci.company_name IS NOT NULL
+         AND btrim(ci.company_name) <> '' AND upper(btrim(ci.company_name)) <> 'NA';
+      RETURN v_domain_only;
+    ELSIF v_domain_cnt > 1 THEN
+      SELECT ci.company_name INTO v_domain_only FROM public.cost_invoices ci
+       WHERE ci.supplier_email_domain = v_domain AND ci.company_name IS NOT NULL
+         AND btrim(ci.company_name) <> '' AND upper(btrim(ci.company_name)) <> 'NA'
+       GROUP BY ci.company_name ORDER BY count(*) DESC, max(ci.created_at) DESC LIMIT 1;
+      IF v_domain_only IS NOT NULL THEN RETURN v_domain_only; END IF;
     END IF;
   END IF;
-
-  IF p_name IS NOT NULL AND btrim(p_name) <> '' AND upper(btrim(p_name)) <> 'NA' THEN
-    v_key := public.company_match_key(p_name);
-    IF v_key IS NOT NULL AND v_key <> '' THEN
-      SELECT canonical_name INTO v_brand_canon
-        FROM public.cost_company_brand_aliases
-       WHERE brand_key = v_key;
-      IF v_brand_canon IS NOT NULL THEN
-        RETURN public.resolve_cost_company_canonical(v_brand_canon);
-      END IF;
-    END IF;
-  END IF;
-
-  IF p_invoice_number IS NOT NULL AND btrim(p_invoice_number) <> '' THEN
-    v_series_canon := public.resolve_company_from_invoice_series(p_from, p_invoice_number);
-    IF v_series_canon IS NOT NULL THEN
-      RETURN public.resolve_cost_company_canonical(v_series_canon);
-    END IF;
-  END IF;
-
-  v_resolved := public.resolve_cost_company_canonical(p_name);
-
-  IF v_trusted AND v_resolved IS NOT NULL
-     AND btrim(v_resolved) <> '' AND upper(btrim(v_resolved)) <> 'NA' THEN
-    INSERT INTO public.cost_company_domain_aliases (domain, canonical_name)
-    VALUES (v_domain, btrim(v_resolved))
-    ON CONFLICT (domain, canonical_name) DO NOTHING;
-
-    IF p_name IS NOT NULL AND btrim(p_name) <> '' AND upper(btrim(p_name)) <> 'NA'
-       AND NOT public.is_legal_entity_name(p_name)
-       AND public.company_match_key(p_name) <> public.company_match_key(v_resolved) THEN
-      INSERT INTO public.cost_company_brand_aliases (brand_key, canonical_name)
-      VALUES (public.company_match_key(p_name), btrim(v_resolved))
-      ON CONFLICT (brand_key) DO UPDATE SET canonical_name = EXCLUDED.canonical_name;
-    END IF;
-  END IF;
-
-  RETURN v_resolved;
-END;
-$$;
+  RETURN NULL;
+END; $$;
 
 
 ALTER FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text", "p_invoice_number" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."resolve_cost_supplier_for_invoice"("p_vat" "text", "p_company_reg" "text", "p_name" "text", "p_from" "text", "p_invoice_number" "text" DEFAULT NULL::"text", "p_source_invoice_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("supplier_id" "uuid", "canonical_name" "text")
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE v_supplier_id uuid; v_canonical text; v_fallback text;
+BEGIN
+  SELECT l.supplier_id, l.canonical_name INTO v_supplier_id, v_canonical FROM public.lookup_cost_supplier_by_identifiers(p_vat, p_company_reg, p_name) l LIMIT 1;
+  IF v_supplier_id IS NOT NULL THEN
+    PERFORM public.upsert_cost_supplier_identifiers(v_supplier_id, p_vat, p_company_reg, p_name, p_source_invoice_id);
+    RETURN QUERY SELECT v_supplier_id, v_canonical; RETURN;
+  END IF;
+  v_fallback := public.resolve_cost_company_for_invoice(p_name, p_from, p_invoice_number);
+  IF v_fallback IS NULL OR btrim(v_fallback) = '' OR upper(btrim(v_fallback)) = 'NA' THEN RETURN; END IF;
+  v_supplier_id := public.find_or_create_cost_supplier(v_fallback);
+  IF v_supplier_id IS NULL THEN RETURN; END IF;
+  SELECT cs.canonical_name INTO v_canonical FROM public.cost_suppliers cs WHERE cs.id = v_supplier_id;
+  PERFORM public.upsert_cost_supplier_identifiers(v_supplier_id, p_vat, p_company_reg, p_name, p_source_invoice_id);
+  RETURN QUERY SELECT v_supplier_id, v_canonical;
+END; $$;
+
+
+ALTER FUNCTION "public"."resolve_cost_supplier_for_invoice"("p_vat" "text", "p_company_reg" "text", "p_name" "text", "p_from" "text", "p_invoice_number" "text", "p_source_invoice_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."rls_auto_enable"() RETURNS "event_trigger"
@@ -1128,6 +1353,20 @@ BEGIN NEW.updated_at = now(); RETURN NEW; END; $$;
 ALTER FUNCTION "public"."set_updated_at_havs_tools"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."set_updated_by"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  NEW.updated_by := auth.uid();
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."set_updated_by"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."submission_owner"("_kind" "public"."submission_kind", "_id" "uuid") RETURNS "uuid"
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -1146,6 +1385,20 @@ $$;
 
 
 ALTER FUNCTION "public"."submission_owner"("_kind" "public"."submission_kind", "_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."supplier_legal_name_key"("p_name" "text") RETURNS "text"
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT NULLIF(
+    lower(btrim(regexp_replace(coalesce(p_name, ''), '\s+', ' ', 'g'))),
+    ''
+  )
+$$;
+
+
+ALTER FUNCTION "public"."supplier_legal_name_key"("p_name" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."timesheet_days_touch_parent"() RETURNS "trigger"
@@ -1263,6 +1516,22 @@ $$;
 ALTER FUNCTION "public"."trigger_cost_scan"("p_url" "text", "p_apikey" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."trusted_supplier_email_domain"("p_from" "text") RETURNS "text"
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT CASE
+    WHEN public.email_domain(p_from) IS NULL OR btrim(public.email_domain(p_from)) = ''
+      OR public.is_generic_email_domain(public.email_domain(p_from))
+      OR public.is_shared_invoice_portal_domain(public.email_domain(p_from))
+      OR public.is_staff_relay_domain(public.email_domain(p_from))
+    THEN NULL ELSE public.email_domain(p_from) END
+$$;
+
+
+ALTER FUNCTION "public"."trusted_supplier_email_domain"("p_from" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."update_updated_at_column"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     SET "search_path" TO 'public'
@@ -1275,6 +1544,53 @@ $$;
 
 
 ALTER FUNCTION "public"."update_updated_at_column"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."upsert_cost_supplier_identifiers"("p_supplier_id" "uuid", "p_vat" "text" DEFAULT NULL::"text", "p_company_reg" "text" DEFAULT NULL::"text", "p_name" "text" DEFAULT NULL::"text", "p_source_invoice_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_vat_key text;
+  v_reg_key text;
+  v_name_key text;
+  v_existing_supplier uuid;
+BEGIN
+  IF p_supplier_id IS NULL THEN RETURN; END IF;
+  v_vat_key := public.normalize_vat_number(p_vat);
+  IF v_vat_key IS NOT NULL THEN
+    SELECT supplier_id INTO v_existing_supplier FROM public.cost_supplier_identifiers WHERE identifier_type = 'vat' AND identifier_key = v_vat_key;
+    IF v_existing_supplier IS NULL OR v_existing_supplier = p_supplier_id THEN
+      INSERT INTO public.cost_supplier_identifiers (supplier_id, identifier_type, identifier_key, raw_value, source_invoice_id)
+      VALUES (p_supplier_id, 'vat', v_vat_key, nullif(btrim(p_vat), ''), p_source_invoice_id)
+      ON CONFLICT (identifier_type, identifier_key) DO NOTHING;
+    END IF;
+  END IF;
+  v_reg_key := public.normalize_company_registration(p_company_reg);
+  IF v_reg_key IS NOT NULL THEN
+    SELECT supplier_id INTO v_existing_supplier FROM public.cost_supplier_identifiers WHERE identifier_type = 'company_registration' AND identifier_key = v_reg_key;
+    IF v_existing_supplier IS NULL OR v_existing_supplier = p_supplier_id THEN
+      INSERT INTO public.cost_supplier_identifiers (supplier_id, identifier_type, identifier_key, raw_value, source_invoice_id)
+      VALUES (p_supplier_id, 'company_registration', v_reg_key, nullif(btrim(p_company_reg), ''), p_source_invoice_id)
+      ON CONFLICT (identifier_type, identifier_key) DO NOTHING;
+    END IF;
+  END IF;
+  IF p_name IS NOT NULL AND btrim(p_name) <> '' AND upper(btrim(p_name)) <> 'NA' THEN
+    v_name_key := public.supplier_legal_name_key(p_name);
+    IF v_name_key IS NOT NULL THEN
+      SELECT supplier_id INTO v_existing_supplier FROM public.cost_supplier_identifiers WHERE identifier_type = 'legal_name' AND identifier_key = v_name_key;
+      IF v_existing_supplier IS NULL OR v_existing_supplier = p_supplier_id THEN
+        INSERT INTO public.cost_supplier_identifiers (supplier_id, identifier_type, identifier_key, raw_value, source_invoice_id)
+        VALUES (p_supplier_id, 'legal_name', v_name_key, btrim(p_name), p_source_invoice_id)
+        ON CONFLICT (identifier_type, identifier_key) DO NOTHING;
+      END IF;
+    END IF;
+  END IF;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."upsert_cost_supplier_identifiers"("p_supplier_id" "uuid", "p_vat" "text", "p_company_reg" "text", "p_name" "text", "p_source_invoice_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."user_subcontractor"("_user_id" "uuid") RETURNS "uuid"
@@ -1440,6 +1756,12 @@ CREATE TABLE IF NOT EXISTS "public"."cost_invoices" (
     "timesheet_check_detail" "text",
     "company_invoice_key" "text" GENERATED ALWAYS AS (NULLIF("lower"("regexp_replace"("btrim"(COALESCE("company_name", ''::"text")), '\s+'::"text", ' '::"text", 'g'::"text")), ''::"text")) STORED,
     "invoice_number_key" "text" GENERATED ALWAYS AS (NULLIF("upper"("regexp_replace"("btrim"(COALESCE("invoice_number", ''::"text")), '\s+'::"text", ''::"text", 'g'::"text")), ''::"text")) STORED,
+    "supplier_email_domain" "text",
+    "invoice_format_key" "text",
+    "supplier_id" "uuid",
+    "supplier_vat_number" "text",
+    "supplier_company_reg_number" "text",
+    "payment_reminded_at" timestamp with time zone,
     CONSTRAINT "cost_invoices_document_type_check" CHECK (("document_type" = ANY (ARRAY['invoice'::"text", 'credit_note'::"text"])))
 );
 
@@ -1511,6 +1833,32 @@ CREATE TABLE IF NOT EXISTS "public"."cost_skip_attachments" (
 
 
 ALTER TABLE "public"."cost_skip_attachments" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."cost_supplier_identifiers" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "supplier_id" "uuid" NOT NULL,
+    "identifier_type" "text" NOT NULL,
+    "identifier_key" "text" NOT NULL,
+    "raw_value" "text",
+    "source_invoice_id" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "cost_supplier_identifiers_identifier_type_check" CHECK (("identifier_type" = ANY (ARRAY['vat'::"text", 'company_registration'::"text", 'legal_name'::"text"])))
+);
+
+
+ALTER TABLE "public"."cost_supplier_identifiers" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."cost_suppliers" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "canonical_name" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."cost_suppliers" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."daily_briefing_attendees" (
@@ -1814,6 +2162,28 @@ CREATE TABLE IF NOT EXISTS "public"."nas_sync_queue" (
 ALTER TABLE "public"."nas_sync_queue" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."notification_preferences" (
+    "user_id" "uuid" NOT NULL,
+    "timesheet_review" boolean DEFAULT true NOT NULL,
+    "timesheet_outcome" boolean DEFAULT true NOT NULL,
+    "holiday_review" boolean DEFAULT true NOT NULL,
+    "holiday_outcome" boolean DEFAULT true NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "cost_payment" boolean DEFAULT true NOT NULL,
+    "cost_review" boolean DEFAULT true NOT NULL,
+    "timesheet_review_roles" "jsonb" DEFAULT '{"admin": true, "worker": true, "manager": true, "cjb_manager": true, "super_admin": true}'::"jsonb" NOT NULL,
+    "holiday_review_roles" "jsonb" DEFAULT '{"admin": true, "worker": true, "manager": true, "cjb_manager": true, "super_admin": true}'::"jsonb" NOT NULL,
+    "timesheet_decision" boolean DEFAULT true NOT NULL,
+    "holiday_decision" boolean DEFAULT true NOT NULL,
+    "todo_updates" boolean DEFAULT true NOT NULL,
+    "timesheet_decision_roles" "jsonb" DEFAULT '{"admin": true, "worker": true, "manager": true, "cjb_manager": true, "super_admin": true}'::"jsonb" NOT NULL,
+    "holiday_decision_roles" "jsonb" DEFAULT '{"admin": true, "worker": true, "manager": true, "cjb_manager": true, "super_admin": true}'::"jsonb" NOT NULL
+);
+
+
+ALTER TABLE "public"."notification_preferences" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."password_recovery_tokens" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "user_id" "uuid" NOT NULL,
@@ -1892,7 +2262,8 @@ CREATE TABLE IF NOT EXISTS "public"."profiles" (
     "must_reset_password" boolean DEFAULT true NOT NULL,
     "last_active_at" timestamp with time zone,
     "recovery_email" "text",
-    "mfa_enabled" boolean DEFAULT false NOT NULL
+    "mfa_enabled" boolean DEFAULT false NOT NULL,
+    "notification_prompt_seen" boolean DEFAULT false NOT NULL
 );
 
 
@@ -1927,6 +2298,21 @@ CREATE TABLE IF NOT EXISTS "public"."projects" (
 
 
 ALTER TABLE "public"."projects" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."push_subscriptions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "endpoint" "text" NOT NULL,
+    "p256dh" "text" NOT NULL,
+    "auth" "text" NOT NULL,
+    "user_agent" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "last_used_at" timestamp with time zone
+);
+
+
+ALTER TABLE "public"."push_subscriptions" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."rams_attendees" (
@@ -2023,6 +2409,71 @@ CREATE TABLE IF NOT EXISTS "public"."timesheets" (
 ALTER TABLE "public"."timesheets" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."todo_item_attachments" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "item_id" "uuid" NOT NULL,
+    "nas_path" "text" NOT NULL,
+    "filename" "text",
+    "created_by" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+ALTER TABLE ONLY "public"."todo_item_attachments" REPLICA IDENTITY FULL;
+
+
+ALTER TABLE "public"."todo_item_attachments" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."todo_items" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "list_id" "uuid" NOT NULL,
+    "title" "text" NOT NULL,
+    "notes" "text",
+    "completed_at" timestamp with time zone,
+    "completed_by" "uuid",
+    "created_by" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_by" "uuid"
+);
+
+ALTER TABLE ONLY "public"."todo_items" REPLICA IDENTITY FULL;
+
+
+ALTER TABLE "public"."todo_items" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."todo_list_assignments" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "list_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "assigned_by" "uuid",
+    "assigned_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+ALTER TABLE ONLY "public"."todo_list_assignments" REPLICA IDENTITY FULL;
+
+
+ALTER TABLE "public"."todo_list_assignments" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."todo_lists" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "title" "text" NOT NULL,
+    "description" "text",
+    "created_by" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "archived_at" timestamp with time zone,
+    "pdf_revision" integer DEFAULT 1 NOT NULL,
+    "updated_by" "uuid"
+);
+
+ALTER TABLE ONLY "public"."todo_lists" REPLICA IDENTITY FULL;
+
+
+ALTER TABLE "public"."todo_lists" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."toolbox_attendees" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "talk_id" "uuid" NOT NULL,
@@ -2056,6 +2507,23 @@ CREATE TABLE IF NOT EXISTS "public"."toolbox_talks" (
 
 
 ALTER TABLE "public"."toolbox_talks" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."user_notifications" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "preference" "text" NOT NULL,
+    "title" "text" NOT NULL,
+    "body" "text" NOT NULL,
+    "url" "text" DEFAULT '/'::"text" NOT NULL,
+    "read_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+ALTER TABLE ONLY "public"."user_notifications" REPLICA IDENTITY FULL;
+
+
+ALTER TABLE "public"."user_notifications" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."user_roles" (
@@ -2195,6 +2663,26 @@ ALTER TABLE ONLY "public"."cost_skip_attachments"
 
 
 
+ALTER TABLE ONLY "public"."cost_supplier_identifiers"
+    ADD CONSTRAINT "cost_supplier_identifiers_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."cost_supplier_identifiers"
+    ADD CONSTRAINT "cost_supplier_identifiers_type_key_unique" UNIQUE ("identifier_type", "identifier_key");
+
+
+
+ALTER TABLE ONLY "public"."cost_suppliers"
+    ADD CONSTRAINT "cost_suppliers_canonical_name_unique" UNIQUE ("canonical_name");
+
+
+
+ALTER TABLE ONLY "public"."cost_suppliers"
+    ADD CONSTRAINT "cost_suppliers_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."daily_briefing_attendees"
     ADD CONSTRAINT "daily_briefing_attendees_pkey" PRIMARY KEY ("id");
 
@@ -2300,6 +2788,11 @@ ALTER TABLE ONLY "public"."nas_sync_queue"
 
 
 
+ALTER TABLE ONLY "public"."notification_preferences"
+    ADD CONSTRAINT "notification_preferences_pkey" PRIMARY KEY ("user_id");
+
+
+
 ALTER TABLE ONLY "public"."password_recovery_tokens"
     ADD CONSTRAINT "password_recovery_tokens_pkey" PRIMARY KEY ("id");
 
@@ -2355,6 +2848,16 @@ ALTER TABLE ONLY "public"."projects"
 
 
 
+ALTER TABLE ONLY "public"."push_subscriptions"
+    ADD CONSTRAINT "push_subscriptions_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."push_subscriptions"
+    ADD CONSTRAINT "push_subscriptions_user_endpoint_unique" UNIQUE ("user_id", "endpoint");
+
+
+
 ALTER TABLE ONLY "public"."rams_attendees"
     ADD CONSTRAINT "rams_attendees_pkey" PRIMARY KEY ("id");
 
@@ -2390,6 +2893,31 @@ ALTER TABLE ONLY "public"."timesheets"
 
 
 
+ALTER TABLE ONLY "public"."todo_item_attachments"
+    ADD CONSTRAINT "todo_item_attachments_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."todo_items"
+    ADD CONSTRAINT "todo_items_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."todo_list_assignments"
+    ADD CONSTRAINT "todo_list_assignments_list_id_user_id_key" UNIQUE ("list_id", "user_id");
+
+
+
+ALTER TABLE ONLY "public"."todo_list_assignments"
+    ADD CONSTRAINT "todo_list_assignments_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."todo_lists"
+    ADD CONSTRAINT "todo_lists_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."toolbox_attendees"
     ADD CONSTRAINT "toolbox_attendees_pkey" PRIMARY KEY ("id");
 
@@ -2397,6 +2925,11 @@ ALTER TABLE ONLY "public"."toolbox_attendees"
 
 ALTER TABLE ONLY "public"."toolbox_talks"
     ADD CONSTRAINT "toolbox_talks_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."user_notifications"
+    ADD CONSTRAINT "user_notifications_pkey" PRIMARY KEY ("id");
 
 
 
@@ -2499,11 +3032,35 @@ CREATE INDEX "idx_cost_invoice_splits_project_id" ON "public"."cost_invoice_spli
 
 
 
+CREATE INDEX "idx_cost_invoices_format_key" ON "public"."cost_invoices" USING "btree" ("invoice_format_key") WHERE ("invoice_format_key" IS NOT NULL);
+
+
+
+CREATE INDEX "idx_cost_invoices_supplier_domain_format" ON "public"."cost_invoices" USING "btree" ("supplier_email_domain", "invoice_format_key") WHERE (("supplier_email_domain" IS NOT NULL) AND ("invoice_format_key" IS NOT NULL));
+
+
+
+CREATE INDEX "idx_cost_invoices_supplier_id" ON "public"."cost_invoices" USING "btree" ("supplier_id") WHERE ("supplier_id" IS NOT NULL);
+
+
+
+CREATE INDEX "idx_cost_supplier_identifiers_lookup" ON "public"."cost_supplier_identifiers" USING "btree" ("identifier_type", "identifier_key");
+
+
+
+CREATE INDEX "idx_cost_supplier_identifiers_supplier" ON "public"."cost_supplier_identifiers" USING "btree" ("supplier_id");
+
+
+
 CREATE INDEX "idx_invoice_lines_invoice_id" ON "public"."invoice_lines" USING "btree" ("invoice_id");
 
 
 
 CREATE INDEX "idx_invoice_lines_project_id" ON "public"."invoice_lines" USING "btree" ("project_id");
+
+
+
+CREATE INDEX "idx_push_subscriptions_user_id" ON "public"."push_subscriptions" USING "btree" ("user_id");
 
 
 
@@ -2567,7 +3124,31 @@ CREATE UNIQUE INDEX "timesheets_worker_week_unique" ON "public"."timesheets" USI
 
 
 
+CREATE INDEX "todo_item_attachments_item_idx" ON "public"."todo_item_attachments" USING "btree" ("item_id");
+
+
+
+CREATE INDEX "todo_items_list_idx" ON "public"."todo_items" USING "btree" ("list_id");
+
+
+
+CREATE INDEX "todo_list_assignments_list_idx" ON "public"."todo_list_assignments" USING "btree" ("list_id");
+
+
+
+CREATE INDEX "todo_list_assignments_user_idx" ON "public"."todo_list_assignments" USING "btree" ("user_id");
+
+
+
 CREATE INDEX "toolbox_talks_briefer_id_talk_date_idx" ON "public"."toolbox_talks" USING "btree" ("briefer_id", "talk_date" DESC);
+
+
+
+CREATE INDEX "user_notifications_user_created_idx" ON "public"."user_notifications" USING "btree" ("user_id", "created_at" DESC);
+
+
+
+CREATE INDEX "user_notifications_user_unread_idx" ON "public"."user_notifications" USING "btree" ("user_id", "created_at" DESC) WHERE ("read_at" IS NULL);
 
 
 
@@ -2603,7 +3184,7 @@ CREATE OR REPLACE TRIGGER "bump_revision_trg" BEFORE UPDATE ON "public"."vehicle
 
 
 
-CREATE OR REPLACE TRIGGER "cost_invoices_canonical_company" BEFORE INSERT OR UPDATE OF "company_name" ON "public"."cost_invoices" FOR EACH ROW EXECUTE FUNCTION "public"."cost_invoices_apply_canonical_company"();
+CREATE OR REPLACE TRIGGER "cost_invoices_canonical_company" BEFORE INSERT OR UPDATE OF "company_name", "source_email_from", "invoice_number", "supplier_vat_number", "supplier_company_reg_number" ON "public"."cost_invoices" FOR EACH ROW EXECUTE FUNCTION "public"."cost_invoices_apply_canonical_company"();
 
 
 
@@ -2687,6 +3268,18 @@ CREATE OR REPLACE TRIGGER "set_nas_sync_queue_updated_at" BEFORE UPDATE ON "publ
 
 
 
+CREATE OR REPLACE TRIGGER "todo_items_set_updated_at" BEFORE UPDATE ON "public"."todo_items" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "todo_items_set_updated_by" BEFORE UPDATE ON "public"."todo_items" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_by"();
+
+
+
+CREATE OR REPLACE TRIGGER "todo_lists_set_updated_by" BEFORE UPDATE ON "public"."todo_lists" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_by"();
+
+
+
 CREATE OR REPLACE TRIGGER "toolbox_autoapprove_t" BEFORE INSERT ON "public"."toolbox_talks" FOR EACH ROW EXECUTE FUNCTION "public"."toolbox_autoapprove"();
 
 
@@ -2762,6 +3355,21 @@ ALTER TABLE ONLY "public"."cost_invoices"
 
 ALTER TABLE ONLY "public"."cost_invoices"
     ADD CONSTRAINT "cost_invoices_subcontractor_id_fkey" FOREIGN KEY ("subcontractor_id") REFERENCES "public"."subcontractors"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."cost_invoices"
+    ADD CONSTRAINT "cost_invoices_supplier_id_fkey" FOREIGN KEY ("supplier_id") REFERENCES "public"."cost_suppliers"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."cost_supplier_identifiers"
+    ADD CONSTRAINT "cost_supplier_identifiers_source_invoice_id_fkey" FOREIGN KEY ("source_invoice_id") REFERENCES "public"."cost_invoices"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."cost_supplier_identifiers"
+    ADD CONSTRAINT "cost_supplier_identifiers_supplier_id_fkey" FOREIGN KEY ("supplier_id") REFERENCES "public"."cost_suppliers"("id") ON DELETE CASCADE;
 
 
 
@@ -2870,6 +3478,11 @@ ALTER TABLE ONLY "public"."invoices"
 
 
 
+ALTER TABLE ONLY "public"."notification_preferences"
+    ADD CONSTRAINT "notification_preferences_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."password_recovery_tokens"
     ADD CONSTRAINT "password_recovery_tokens_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
@@ -2940,6 +3553,11 @@ ALTER TABLE ONLY "public"."projects"
 
 
 
+ALTER TABLE ONLY "public"."push_subscriptions"
+    ADD CONSTRAINT "push_subscriptions_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."rams_attendees"
     ADD CONSTRAINT "rams_attendees_briefing_id_fkey" FOREIGN KEY ("briefing_id") REFERENCES "public"."rams_briefings"("id") ON DELETE CASCADE;
 
@@ -2990,6 +3608,61 @@ ALTER TABLE ONLY "public"."timesheets"
 
 
 
+ALTER TABLE ONLY "public"."todo_item_attachments"
+    ADD CONSTRAINT "todo_item_attachments_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."todo_item_attachments"
+    ADD CONSTRAINT "todo_item_attachments_item_id_fkey" FOREIGN KEY ("item_id") REFERENCES "public"."todo_items"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."todo_items"
+    ADD CONSTRAINT "todo_items_completed_by_fkey" FOREIGN KEY ("completed_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."todo_items"
+    ADD CONSTRAINT "todo_items_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."todo_items"
+    ADD CONSTRAINT "todo_items_list_id_fkey" FOREIGN KEY ("list_id") REFERENCES "public"."todo_lists"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."todo_items"
+    ADD CONSTRAINT "todo_items_updated_by_fkey" FOREIGN KEY ("updated_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."todo_list_assignments"
+    ADD CONSTRAINT "todo_list_assignments_assigned_by_fkey" FOREIGN KEY ("assigned_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."todo_list_assignments"
+    ADD CONSTRAINT "todo_list_assignments_list_id_fkey" FOREIGN KEY ("list_id") REFERENCES "public"."todo_lists"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."todo_list_assignments"
+    ADD CONSTRAINT "todo_list_assignments_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."todo_lists"
+    ADD CONSTRAINT "todo_lists_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."todo_lists"
+    ADD CONSTRAINT "todo_lists_updated_by_fkey" FOREIGN KEY ("updated_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
 ALTER TABLE ONLY "public"."toolbox_attendees"
     ADD CONSTRAINT "toolbox_attendees_talk_id_fkey" FOREIGN KEY ("talk_id") REFERENCES "public"."toolbox_talks"("id") ON DELETE CASCADE;
 
@@ -3017,6 +3690,11 @@ ALTER TABLE ONLY "public"."toolbox_talks"
 
 ALTER TABLE ONLY "public"."toolbox_talks"
     ADD CONSTRAINT "toolbox_talks_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id");
+
+
+
+ALTER TABLE ONLY "public"."user_notifications"
+    ADD CONSTRAINT "user_notifications_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -3083,6 +3761,14 @@ CREATE POLICY "Admins manage cost company brand aliases" ON "public"."cost_compa
 
 
 CREATE POLICY "Admins manage cost company domain aliases" ON "public"."cost_company_domain_aliases" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+
+
+
+CREATE POLICY "Admins manage cost_supplier_identifiers" ON "public"."cost_supplier_identifiers" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "Admins manage cost_suppliers" ON "public"."cost_suppliers" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
 
@@ -3216,6 +3902,12 @@ ALTER TABLE "public"."cost_scan_state" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."cost_skip_attachments" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."cost_supplier_identifiers" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."cost_suppliers" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."daily_briefing_attendees" ENABLE ROW LEVEL SECURITY;
@@ -3380,6 +4072,21 @@ CREATE POLICY "invoices admin all" ON "public"."invoices" TO "authenticated" USI
 ALTER TABLE "public"."nas_sync_queue" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."notification_preferences" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "notification_preferences self insert" ON "public"."notification_preferences" FOR INSERT TO "authenticated" WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "notification_preferences self read" ON "public"."notification_preferences" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "notification_preferences self update" ON "public"."notification_preferences" FOR UPDATE TO "authenticated" USING (("user_id" = "auth"."uid"())) WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
 ALTER TABLE "public"."password_recovery_tokens" ENABLE ROW LEVEL SECURITY;
 
 
@@ -3476,6 +4183,21 @@ CREATE POLICY "projects admin write" ON "public"."projects" TO "authenticated" U
 
 
 CREATE POLICY "projects read" ON "public"."projects" FOR SELECT TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'cjb_manager'::"public"."app_role") OR ("archived_at" IS NULL)));
+
+
+
+ALTER TABLE "public"."push_subscriptions" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "push_subscriptions self delete" ON "public"."push_subscriptions" FOR DELETE TO "authenticated" USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "push_subscriptions self insert" ON "public"."push_subscriptions" FOR INSERT TO "authenticated" WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "push_subscriptions self read" ON "public"."push_subscriptions" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
 
 
 
@@ -3643,10 +4365,97 @@ CREATE POLICY "timesheets update owner unapproved or staff" ON "public"."timeshe
 
 
 
+CREATE POLICY "todo assignments admin write" ON "public"."todo_list_assignments" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "todo assignments manager delete" ON "public"."todo_list_assignments" FOR DELETE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id"))));
+
+
+
+CREATE POLICY "todo assignments manager insert" ON "public"."todo_list_assignments" FOR INSERT TO "authenticated" WITH CHECK (("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id"))));
+
+
+
+CREATE POLICY "todo assignments read" ON "public"."todo_list_assignments" FOR SELECT TO "authenticated" USING ((("user_id" = "auth"."uid"()) OR "public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id"))));
+
+
+
+CREATE POLICY "todo attachments delete" ON "public"."todo_item_attachments" FOR DELETE TO "authenticated" USING ("public"."can_modify_todo_item"("auth"."uid"(), "item_id"));
+
+
+
+CREATE POLICY "todo attachments insert" ON "public"."todo_item_attachments" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_modify_todo_item"("auth"."uid"(), "item_id"));
+
+
+
+CREATE POLICY "todo attachments read" ON "public"."todo_item_attachments" FOR SELECT TO "authenticated" USING ("public"."can_access_todo_item"("auth"."uid"(), "item_id"));
+
+
+
+CREATE POLICY "todo items delete" ON "public"."todo_items" FOR DELETE TO "authenticated" USING ("public"."can_modify_todo_item"("auth"."uid"(), "id"));
+
+
+
+CREATE POLICY "todo items insert" ON "public"."todo_items" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_access_todo_list"("auth"."uid"(), "list_id"));
+
+
+
+CREATE POLICY "todo items read" ON "public"."todo_items" FOR SELECT TO "authenticated" USING ("public"."can_access_todo_list"("auth"."uid"(), "list_id"));
+
+
+
+CREATE POLICY "todo items update" ON "public"."todo_items" FOR UPDATE TO "authenticated" USING ("public"."can_modify_todo_item"("auth"."uid"(), "id")) WITH CHECK ("public"."can_modify_todo_item"("auth"."uid"(), "id"));
+
+
+
+CREATE POLICY "todo lists admin delete" ON "public"."todo_lists" FOR DELETE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "todo lists admin update" ON "public"."todo_lists" FOR UPDATE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "todo lists insert" ON "public"."todo_lists" FOR INSERT TO "authenticated" WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role")));
+
+
+
+CREATE POLICY "todo lists read" ON "public"."todo_lists" FOR SELECT TO "authenticated" USING ("public"."can_access_todo_list"("auth"."uid"(), "id"));
+
+
+
+ALTER TABLE "public"."todo_item_attachments" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."todo_items" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."todo_list_assignments" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."todo_lists" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."toolbox_attendees" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."toolbox_talks" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."user_notifications" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "user_notifications self delete" ON "public"."user_notifications" FOR DELETE TO "authenticated" USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "user_notifications self read" ON "public"."user_notifications" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "user_notifications self update" ON "public"."user_notifications" FOR UPDATE TO "authenticated" USING (("user_id" = "auth"."uid"())) WITH CHECK (("user_id" = "auth"."uid"()));
+
 
 
 ALTER TABLE "public"."user_roles" ENABLE ROW LEVEL SECURITY;
@@ -3714,6 +4523,30 @@ CREATE POLICY "vehicles read authed" ON "public"."vehicles" FOR SELECT TO "authe
 
 
 ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
+
+
+
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."todo_item_attachments";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."todo_items";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."todo_list_assignments";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."todo_lists";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."user_notifications";
+
 
 
 SET SESSION AUTHORIZATION "postgres";
@@ -4008,9 +4841,27 @@ GRANT ALL ON FUNCTION "public"."can_access_submission"("_kind" "public"."submiss
 
 
 
+REVOKE ALL ON FUNCTION "public"."can_access_todo_item"("_user_id" "uuid", "_item_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_access_todo_item"("_user_id" "uuid", "_item_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_access_todo_item"("_user_id" "uuid", "_item_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."can_access_todo_list"("_user_id" "uuid", "_list_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_access_todo_list"("_user_id" "uuid", "_list_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_access_todo_list"("_user_id" "uuid", "_list_id" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."can_manage_submission"("_worker_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."can_manage_submission"("_worker_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_manage_submission"("_worker_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."can_modify_todo_item"("_user_id" "uuid", "_item_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_modify_todo_item"("_user_id" "uuid", "_item_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_modify_todo_item"("_user_id" "uuid", "_item_id" "uuid") TO "service_role";
 
 
 
@@ -4044,6 +4895,12 @@ GRANT ALL ON FUNCTION "public"."delete_integration_secret"("p_name" "text") TO "
 GRANT ALL ON FUNCTION "public"."email_domain"("p_from" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."email_domain"("p_from" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."email_domain"("p_from" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."find_or_create_cost_supplier"("p_canonical_name" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."find_or_create_cost_supplier"("p_canonical_name" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."find_or_create_cost_supplier"("p_canonical_name" "text") TO "service_role";
 
 
 
@@ -4093,6 +4950,12 @@ GRANT ALL ON FUNCTION "public"."holidays_prevent_overlap"() TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."invoice_format_key"("p_invoice_number" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."invoice_format_key"("p_invoice_number" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."invoice_format_key"("p_invoice_number" "text") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."invoices_before_insert"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."invoices_before_insert"() TO "service_role";
 
@@ -4101,6 +4964,12 @@ GRANT ALL ON FUNCTION "public"."invoices_before_insert"() TO "service_role";
 REVOKE ALL ON FUNCTION "public"."is_assigned_to_project"("_user_id" "uuid", "_project_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."is_assigned_to_project"("_user_id" "uuid", "_project_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_assigned_to_project"("_user_id" "uuid", "_project_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."is_assigned_to_todo_list"("_user_id" "uuid", "_list_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_assigned_to_todo_list"("_user_id" "uuid", "_list_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_assigned_to_todo_list"("_user_id" "uuid", "_list_id" "uuid") TO "service_role";
 
 
 
@@ -4128,8 +4997,38 @@ GRANT ALL ON FUNCTION "public"."is_staff"("_user_id" "uuid") TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."match_subcontractor_by_company"("p_company" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."match_subcontractor_by_company"("p_company" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."most_common_cost_company_name"("p_match_key" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."most_common_cost_company_name"("p_match_key" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."most_common_cost_company_name"("p_match_key" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."normalize_company_registration"("p_reg" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."normalize_company_registration"("p_reg" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."normalize_company_registration"("p_reg" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."normalize_vat_number"("p_vat" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."normalize_vat_number"("p_vat" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."normalize_vat_number"("p_vat" "text") TO "service_role";
 
 
 
@@ -4147,6 +5046,12 @@ GRANT ALL ON FUNCTION "public"."pick_domain_canonical"("p_domain" "text") TO "se
 
 REVOKE ALL ON FUNCTION "public"."profiles_guard_sensitive_self_update"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."profiles_guard_sensitive_self_update"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."resolve_company_from_costs_table"("p_domain" "text", "p_format_key" "text", "p_pdf_name" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."resolve_company_from_costs_table"("p_domain" "text", "p_format_key" "text", "p_pdf_name" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."resolve_company_from_costs_table"("p_domain" "text", "p_format_key" "text", "p_pdf_name" "text") TO "service_role";
 
 
 
@@ -4173,6 +5078,12 @@ GRANT ALL ON FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text
 
 
 
+GRANT ALL ON FUNCTION "public"."resolve_cost_supplier_for_invoice"("p_vat" "text", "p_company_reg" "text", "p_name" "text", "p_from" "text", "p_invoice_number" "text", "p_source_invoice_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."resolve_cost_supplier_for_invoice"("p_vat" "text", "p_company_reg" "text", "p_name" "text", "p_from" "text", "p_invoice_number" "text", "p_source_invoice_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."resolve_cost_supplier_for_invoice"("p_vat" "text", "p_company_reg" "text", "p_name" "text", "p_from" "text", "p_invoice_number" "text", "p_source_invoice_id" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."rls_auto_enable"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."rls_auto_enable"() TO "service_role";
 
@@ -4194,9 +5105,20 @@ GRANT ALL ON FUNCTION "public"."set_updated_at_havs_tools"() TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "public"."set_updated_by"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."set_updated_by"() TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."submission_owner"("_kind" "public"."submission_kind", "_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."submission_owner"("_kind" "public"."submission_kind", "_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."submission_owner"("_kind" "public"."submission_kind", "_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."supplier_legal_name_key"("p_name" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."supplier_legal_name_key"("p_name" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."supplier_legal_name_key"("p_name" "text") TO "service_role";
 
 
 
@@ -4221,9 +5143,21 @@ GRANT ALL ON FUNCTION "public"."trigger_cost_scan"("p_url" "text", "p_apikey" "t
 
 
 
+GRANT ALL ON FUNCTION "public"."trusted_supplier_email_domain"("p_from" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."trusted_supplier_email_domain"("p_from" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."trusted_supplier_email_domain"("p_from" "text") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "anon";
 GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."upsert_cost_supplier_identifiers"("p_supplier_id" "uuid", "p_vat" "text", "p_company_reg" "text", "p_name" "text", "p_source_invoice_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."upsert_cost_supplier_identifiers"("p_supplier_id" "uuid", "p_vat" "text", "p_company_reg" "text", "p_name" "text", "p_source_invoice_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."upsert_cost_supplier_identifiers"("p_supplier_id" "uuid", "p_vat" "text", "p_company_reg" "text", "p_name" "text", "p_source_invoice_id" "uuid") TO "service_role";
 
 
 
@@ -4332,6 +5266,18 @@ GRANT ALL ON TABLE "public"."cost_skip_attachments" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."cost_supplier_identifiers" TO "anon";
+GRANT ALL ON TABLE "public"."cost_supplier_identifiers" TO "authenticated";
+GRANT ALL ON TABLE "public"."cost_supplier_identifiers" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."cost_suppliers" TO "anon";
+GRANT ALL ON TABLE "public"."cost_suppliers" TO "authenticated";
+GRANT ALL ON TABLE "public"."cost_suppliers" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."daily_briefing_attendees" TO "anon";
 GRANT ALL ON TABLE "public"."daily_briefing_attendees" TO "authenticated";
 GRANT ALL ON TABLE "public"."daily_briefing_attendees" TO "service_role";
@@ -4428,6 +5374,12 @@ GRANT ALL ON TABLE "public"."nas_sync_queue" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."notification_preferences" TO "anon";
+GRANT ALL ON TABLE "public"."notification_preferences" TO "authenticated";
+GRANT ALL ON TABLE "public"."notification_preferences" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."password_recovery_tokens" TO "anon";
 GRANT ALL ON TABLE "public"."password_recovery_tokens" TO "authenticated";
 GRANT ALL ON TABLE "public"."password_recovery_tokens" TO "service_role";
@@ -4515,6 +5467,12 @@ GRANT ALL ON TABLE "public"."projects" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."push_subscriptions" TO "anon";
+GRANT ALL ON TABLE "public"."push_subscriptions" TO "authenticated";
+GRANT ALL ON TABLE "public"."push_subscriptions" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."rams_attendees" TO "anon";
 GRANT ALL ON TABLE "public"."rams_attendees" TO "authenticated";
 GRANT ALL ON TABLE "public"."rams_attendees" TO "service_role";
@@ -4551,6 +5509,30 @@ GRANT ALL ON TABLE "public"."timesheets" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."todo_item_attachments" TO "anon";
+GRANT ALL ON TABLE "public"."todo_item_attachments" TO "authenticated";
+GRANT ALL ON TABLE "public"."todo_item_attachments" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."todo_items" TO "anon";
+GRANT ALL ON TABLE "public"."todo_items" TO "authenticated";
+GRANT ALL ON TABLE "public"."todo_items" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."todo_list_assignments" TO "anon";
+GRANT ALL ON TABLE "public"."todo_list_assignments" TO "authenticated";
+GRANT ALL ON TABLE "public"."todo_list_assignments" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."todo_lists" TO "anon";
+GRANT ALL ON TABLE "public"."todo_lists" TO "authenticated";
+GRANT ALL ON TABLE "public"."todo_lists" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."toolbox_attendees" TO "anon";
 GRANT ALL ON TABLE "public"."toolbox_attendees" TO "authenticated";
 GRANT ALL ON TABLE "public"."toolbox_attendees" TO "service_role";
@@ -4560,6 +5542,12 @@ GRANT ALL ON TABLE "public"."toolbox_attendees" TO "service_role";
 GRANT ALL ON TABLE "public"."toolbox_talks" TO "anon";
 GRANT ALL ON TABLE "public"."toolbox_talks" TO "authenticated";
 GRANT ALL ON TABLE "public"."toolbox_talks" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."user_notifications" TO "anon";
+GRANT ALL ON TABLE "public"."user_notifications" TO "authenticated";
+GRANT ALL ON TABLE "public"."user_notifications" TO "service_role";
 
 
 
