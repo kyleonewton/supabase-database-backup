@@ -2896,6 +2896,23 @@ $$;
 ALTER FUNCTION "public"."set_updated_by"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."shares_todo_list_with"("_user_id" "uuid", "_other_user_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.todo_list_assignments a
+    JOIN public.todo_list_assignments b ON a.list_id = b.list_id
+    WHERE a.user_id = _user_id
+      AND b.user_id = _other_user_id
+  )
+$$;
+
+
+ALTER FUNCTION "public"."shares_todo_list_with"("_user_id" "uuid", "_other_user_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."split_line_matches_description_filter"("p_split_description" "text", "p_f_description" "text") RETURNS boolean
     LANGUAGE "sql" IMMUTABLE
     SET "search_path" TO 'public'
@@ -3663,7 +3680,8 @@ CREATE TABLE IF NOT EXISTS "public"."notification_preferences" (
     "vehicle_defect_submit_reminder" boolean DEFAULT true NOT NULL,
     "timesheet_submit_reminder" boolean DEFAULT true NOT NULL,
     "havs_submit_reminder" boolean DEFAULT true NOT NULL,
-    "vehicle_service_due" boolean DEFAULT true NOT NULL
+    "vehicle_service_due" boolean DEFAULT true NOT NULL,
+    "todo_reminder" boolean DEFAULT true NOT NULL
 );
 
 
@@ -3920,7 +3938,9 @@ CREATE TABLE IF NOT EXISTS "public"."todo_items" (
     "created_by" "uuid",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_by" "uuid"
+    "updated_by" "uuid",
+    "remind_at" timestamp with time zone,
+    "reminder_sent_at" timestamp with time zone
 );
 
 ALTER TABLE ONLY "public"."todo_items" REPLICA IDENTITY FULL;
@@ -3953,7 +3973,9 @@ CREATE TABLE IF NOT EXISTS "public"."todo_lists" (
     "pdf_revision" integer DEFAULT 1 NOT NULL,
     "updated_by" "uuid",
     "pdf_nas_path" "text",
-    "pdf_content_hash" "text"
+    "pdf_content_hash" "text",
+    "remind_at" timestamp with time zone,
+    "reminder_sent_at" timestamp with time zone
 );
 
 ALTER TABLE ONLY "public"."todo_lists" REPLICA IDENTITY FULL;
@@ -4682,6 +4704,10 @@ CREATE INDEX "todo_item_attachments_item_idx" ON "public"."todo_item_attachments
 
 
 
+CREATE INDEX "todo_items_due_reminder_idx" ON "public"."todo_items" USING "btree" ("remind_at") WHERE (("remind_at" IS NOT NULL) AND ("reminder_sent_at" IS NULL) AND ("completed_at" IS NULL));
+
+
+
 CREATE INDEX "todo_items_list_idx" ON "public"."todo_items" USING "btree" ("list_id");
 
 
@@ -4691,6 +4717,10 @@ CREATE INDEX "todo_list_assignments_list_idx" ON "public"."todo_list_assignments
 
 
 CREATE INDEX "todo_list_assignments_user_idx" ON "public"."todo_list_assignments" USING "btree" ("user_id");
+
+
+
+CREATE INDEX "todo_lists_due_reminder_idx" ON "public"."todo_lists" USING "btree" ("remind_at") WHERE (("remind_at" IS NOT NULL) AND ("reminder_sent_at" IS NULL) AND ("archived_at" IS NULL));
 
 
 
@@ -5764,7 +5794,7 @@ CREATE POLICY "profiles admin all" ON "public"."profiles" TO "authenticated" USI
 
 
 
-CREATE POLICY "profiles self read" ON "public"."profiles" FOR SELECT TO "authenticated" USING ((("id" = "auth"."uid"()) OR "public"."is_staff"("auth"."uid"())));
+CREATE POLICY "profiles self read" ON "public"."profiles" FOR SELECT TO "authenticated" USING ((("id" = "auth"."uid"()) OR "public"."is_staff"("auth"."uid"()) OR "public"."shares_todo_list_with"("auth"."uid"(), "id")));
 
 
 
@@ -6914,6 +6944,12 @@ GRANT ALL ON FUNCTION "public"."set_updated_at_havs_tools"() TO "service_role";
 
 REVOKE ALL ON FUNCTION "public"."set_updated_by"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."set_updated_by"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."shares_todo_list_with"("_user_id" "uuid", "_other_user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."shares_todo_list_with"("_user_id" "uuid", "_other_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."shares_todo_list_with"("_user_id" "uuid", "_other_user_id" "uuid") TO "service_role";
 
 
 
