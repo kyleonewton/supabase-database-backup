@@ -175,6 +175,240 @@ $$;
 ALTER FUNCTION "public"."admin_set_vault_secret"("p_name" "text", "p_value" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT ''::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_payment_month" "text" DEFAULT NULL::"text") RETURNS "jsonb"
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $_$
+  WITH filtered AS (
+    SELECT ci.*
+    FROM public.cost_invoices ci
+    WHERE public.cost_invoice_passes_filters(
+      ci,
+      p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type, p_f_company,
+      p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
+      p_f_project, p_f_check, p_dup_only, p_missing_due_date
+    )
+  ),
+  filtered_for_missing_count AS (
+    SELECT ci.*
+    FROM public.cost_invoices ci
+    WHERE public.cost_invoice_passes_filters(
+      ci,
+      p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type, p_f_company,
+      p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
+      p_f_project, p_f_check, p_dup_only,
+      false
+    )
+  ),
+  missing_due_date_count AS (
+    SELECT count(*)::bigint AS cnt
+    FROM filtered_for_missing_count f
+    WHERE f.due_date IS NULL
+  ),
+  payment_end AS (
+    SELECT CASE
+      WHEN p_payment_month IS NULL OR p_payment_month !~ '^\d{4}-\d{2}$' THEN NULL::date
+      ELSE (
+        (split_part(p_payment_month, '-', 1) || '-' || split_part(p_payment_month, '-', 2) || '-01')::date
+        + interval '1 month'
+        - interval '1 day'
+      )::date
+    END AS end_date
+  ),
+  split_qty AS (
+    SELECT coalesce(sum(s.quantity), 0) AS split_quantity_total
+    FROM filtered f
+    INNER JOIN public.cost_invoice_splits s ON s.cost_invoice_id = f.id
+    WHERE cardinality(public.parse_description_filter_terms(p_f_description)) > 0
+      AND public.split_line_matches_description_filter(s.description, p_f_description)
+  ),
+  summary AS (
+    SELECT
+      coalesce(sum(coalesce(f.total_amount, f.net_amount + coalesce(f.vat_amount, 0))), 0) AS spend,
+      coalesce(sum(CASE WHEN f.vat_treatment = 'standard_20' THEN coalesce(f.vat_amount, 0) ELSE 0 END), 0) AS input_vat,
+      coalesce(sum(CASE WHEN f.vat_treatment = 'reverse_charge' THEN coalesce(f.net_amount, 0) ELSE 0 END), 0) AS rc_net,
+      coalesce(sum(coalesce(f.cis_amount, 0)), 0) AS cis,
+      count(*) FILTER (WHERE f.status = 'pending_review') AS pending,
+      count(*) FILTER (WHERE f.is_duplicate OR f.has_duplicate_siblings) AS dupes,
+      coalesce(sum(coalesce(f.net_amount, 0)), 0) AS net,
+      count(*) FILTER (WHERE f.paid_at IS NULL) AS unpaid_count
+    FROM filtered f
+  ),
+  company_rows AS (
+    SELECT
+      coalesce(f.company_name, 'NA') AS company,
+      coalesce(f.net_amount, 0) AS net,
+      coalesce(f.vat_amount, 0) AS vat,
+      coalesce(f.cis_amount, 0) AS cis,
+      coalesce(f.total_amount, coalesce(f.net_amount, 0) + coalesce(f.vat_amount, 0)) AS total,
+      f.paid_at,
+      f.status,
+      f.due_date,
+      f.payment_reminded_at,
+      f.payment_reminder_dismissed_at
+    FROM filtered f
+  ),
+  company_groups AS (
+    SELECT
+      cr.company,
+      sum(cr.net) AS net,
+      sum(cr.vat) AS vat,
+      sum(cr.cis) AS cis,
+      sum(cr.total) AS total,
+      sum(cr.total) FILTER (WHERE cr.paid_at IS NOT NULL) AS total_paid,
+      sum(cr.total) FILTER (WHERE cr.paid_at IS NULL) AS total_unpaid,
+      sum(cr.total) FILTER (
+        WHERE cr.status = 'reviewed'
+          AND cr.paid_at IS NULL
+          AND cr.due_date IS NOT NULL
+          AND (SELECT end_date FROM payment_end) IS NOT NULL
+          AND cr.due_date <= (SELECT end_date FROM payment_end)
+      ) AS payment_due,
+      count(*) FILTER (
+        WHERE cr.status = 'reviewed'
+          AND cr.paid_at IS NULL
+          AND cr.due_date IS NOT NULL
+          AND (SELECT end_date FROM payment_end) IS NOT NULL
+          AND cr.due_date <= (SELECT end_date FROM payment_end)
+      ) AS payment_due_count,
+      count(*) FILTER (WHERE cr.status = 'pending_review') AS pending,
+      count(*) FILTER (WHERE cr.status = 'reviewed') AS reviewed,
+      count(*) FILTER (WHERE cr.status = 'rejected') AS rejected,
+      count(*) AS count,
+      count(*) FILTER (WHERE cr.paid_at IS NOT NULL) AS paid_count,
+      bool_or(cr.payment_reminded_at IS NOT NULL AND cr.paid_at IS NULL) AS payment_reminded,
+      bool_or(cr.payment_reminder_dismissed_at IS NOT NULL AND cr.paid_at IS NULL) AS payment_reminder_dismissed
+    FROM company_rows cr
+    GROUP BY cr.company
+  )
+  SELECT jsonb_build_object(
+    'summary', (
+      SELECT jsonb_build_object(
+        'spend', s.spend,
+        'inputVat', s.input_vat,
+        'rcNet', s.rc_net,
+        'cis', s.cis,
+        'pending', s.pending,
+        'dupes', s.dupes,
+        'net', s.net,
+        'unpaidCount', s.unpaid_count,
+        'missingDueDateCount', (SELECT cnt FROM missing_due_date_count),
+        'splitQuantityTotal', (SELECT split_quantity_total FROM split_qty)
+      )
+      FROM summary s
+    ),
+    'groups', coalesce(
+      (
+        SELECT jsonb_agg(
+          jsonb_build_object(
+            'company', g.company,
+            'net', g.net,
+            'vat', g.vat,
+            'cis', g.cis,
+            'total', g.total,
+            'totalPaid', g.total_paid,
+            'totalUnpaid', g.total_unpaid,
+            'paymentDue', g.payment_due,
+            'paymentDueCount', g.payment_due_count,
+            'pending', g.pending,
+            'reviewed', g.reviewed,
+            'rejected', g.rejected,
+            'count', g.count,
+            'paidCount', g.paid_count,
+            'paymentReminded', g.payment_reminded,
+            'paymentReminderDismissed', g.payment_reminder_dismissed,
+            'allPaid', g.count > 0 AND g.paid_count = g.count
+          )
+          ORDER BY g.total DESC
+        )
+        FROM company_groups g
+      ),
+      '[]'::jsonb
+    ),
+    'totals', (
+      SELECT jsonb_build_object(
+        'net', coalesce(sum(g.net), 0),
+        'vat', coalesce(sum(g.vat), 0),
+        'cis', coalesce(sum(g.cis), 0),
+        'total', coalesce(sum(g.total), 0),
+        'totalPaid', coalesce(sum(g.total_paid), 0),
+        'totalUnpaid', coalesce(sum(g.total_unpaid), 0),
+        'paymentDue', coalesce(sum(g.payment_due), 0),
+        'paymentDueCount', coalesce(sum(g.payment_due_count), 0),
+        'pending', coalesce(sum(g.pending), 0),
+        'reviewed', coalesce(sum(g.reviewed), 0),
+        'rejected', coalesce(sum(g.rejected), 0),
+        'count', coalesce(sum(g.count), 0),
+        'paidCount', coalesce(sum(g.paid_count), 0),
+        'allPaid', coalesce(sum(g.count), 0) > 0 AND coalesce(sum(g.paid_count), 0) = coalesce(sum(g.count), 0)
+      )
+      FROM company_groups g
+    )
+  );
+$_$;
+
+
+ALTER FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_payment_month" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."aggregate_invoices"("p_f_text" "text" DEFAULT ''::"text", "p_f_client" "uuid" DEFAULT NULL::"uuid", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_vat" "text" DEFAULT ''::"text", "p_f_project" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  WITH filtered AS (
+    SELECT i.*
+    FROM public.invoices i
+    WHERE public.outgoing_invoice_passes_filters(
+      i, p_f_text, p_f_client, p_f_from, p_f_to, p_f_vat, p_f_project
+    )
+  ),
+  invoice_nets AS (
+    SELECT
+      f.id,
+      coalesce(nullif(trim(f.client_name_snapshot), ''), '—') AS client_name,
+      CASE
+        WHEN p_f_project IS NOT NULL THEN (
+          SELECT coalesce(sum(il.amount_net), 0)
+          FROM public.invoice_lines il
+          WHERE il.invoice_id = f.id
+            AND il.project_id = p_f_project
+        )
+        ELSE coalesce(f.amount_net, 0)
+      END AS net
+    FROM filtered f
+  ),
+  client_groups AS (
+    SELECT
+      n.client_name,
+      count(*)::bigint AS invoice_count,
+      coalesce(sum(n.net), 0) AS net_total
+    FROM invoice_nets n
+    GROUP BY n.client_name
+  )
+  SELECT jsonb_build_object(
+    'count', (SELECT count(*)::bigint FROM filtered),
+    'totalNet', (SELECT coalesce(sum(net), 0) FROM invoice_nets),
+    'byClient', coalesce(
+      (
+        SELECT jsonb_agg(
+          jsonb_build_object(
+            'name', g.client_name,
+            'count', g.invoice_count,
+            'net', g.net_total
+          )
+          ORDER BY g.net_total DESC, g.client_name ASC
+        )
+        FROM client_groups g
+      ),
+      '[]'::jsonb
+    )
+  );
+$$;
+
+
+ALTER FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."bump_revision"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -346,6 +580,416 @@ $$;
 
 ALTER FUNCTION "public"."continue_cost_scan"("p_url" "text", "p_apikey" "text") OWNER TO "postgres";
 
+SET default_tablespace = '';
+
+SET default_table_access_method = "heap";
+
+
+CREATE TABLE IF NOT EXISTS "public"."cost_invoices" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "status" "public"."cost_invoice_status" DEFAULT 'pending_review'::"public"."cost_invoice_status" NOT NULL,
+    "company_name" "text",
+    "company_name_raw" "text",
+    "invoice_number" "text",
+    "po_reference" "text",
+    "invoice_date" "date",
+    "due_date" "date",
+    "due_date_rule" "text",
+    "description" "text",
+    "currency" "text" DEFAULT 'GBP'::"text" NOT NULL,
+    "net_amount" numeric(12,2),
+    "vat_amount" numeric(12,2),
+    "total_amount" numeric(12,2),
+    "vat_treatment" "public"."cost_vat_treatment" DEFAULT 'unknown'::"public"."cost_vat_treatment" NOT NULL,
+    "nas_path" "text",
+    "attachment_filename" "text",
+    "attachment_sha256" "text",
+    "source_email_from" "text",
+    "source_subject" "text",
+    "source_message_id" "text",
+    "source_received_at" timestamp with time zone,
+    "gemini_confidence" numeric(4,3),
+    "is_duplicate" boolean DEFAULT false NOT NULL,
+    "duplicate_of" "uuid",
+    "notes" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "paid_at" timestamp with time zone,
+    "cis_amount" numeric(12,2),
+    "document_type" "text" DEFAULT 'invoice'::"text" NOT NULL,
+    "nas_fallback_path" "text",
+    "project_id" "uuid",
+    "project_other" "text",
+    "is_overhead" boolean DEFAULT false NOT NULL,
+    "subcontractor_id" "uuid",
+    "timesheet_check_status" "text" DEFAULT 'unchecked'::"text" NOT NULL,
+    "timesheet_check_at" timestamp with time zone,
+    "timesheet_check_detail" "text",
+    "company_invoice_key" "text" GENERATED ALWAYS AS (NULLIF("lower"("regexp_replace"("btrim"(COALESCE("company_name", ''::"text")), '\s+'::"text", ' '::"text", 'g'::"text")), ''::"text")) STORED,
+    "invoice_number_key" "text" GENERATED ALWAYS AS (NULLIF("upper"("regexp_replace"("btrim"(COALESCE("invoice_number", ''::"text")), '\s+'::"text", ''::"text", 'g'::"text")), ''::"text")) STORED,
+    "supplier_email_domain" "text",
+    "invoice_format_key" "text",
+    "supplier_id" "uuid",
+    "supplier_vat_number" "text",
+    "supplier_company_reg_number" "text",
+    "payment_reminded_at" timestamp with time zone,
+    "full_field_dedupe_key" "text",
+    "has_duplicate_siblings" boolean DEFAULT false NOT NULL,
+    "search_document" "tsvector",
+    "payment_reminder_month" "text",
+    "payment_reminder_dismissed_at" timestamp with time zone,
+    CONSTRAINT "cost_invoices_document_type_check" CHECK (("document_type" = ANY (ARRAY['invoice'::"text", 'credit_note'::"text"])))
+);
+
+
+ALTER TABLE "public"."cost_invoices" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."cost_invoices"."payment_reminder_month" IS 'YYYY-MM payment month when a payment reminder was sent (costs notify-to-pay).';
+
+
+
+COMMENT ON COLUMN "public"."cost_invoices"."payment_reminder_dismissed_at" IS 'When a payment reminder was dismissed without marking invoices paid.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."cost_invoice_build_search_document"("p_row" "public"."cost_invoices") RETURNS "tsvector"
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT to_tsvector(
+    'english',
+    concat_ws(
+      ' ',
+      p_row.company_name,
+      p_row.invoice_number,
+      p_row.po_reference,
+      p_row.description,
+      p_row.source_subject
+    )
+  );
+$$;
+
+
+ALTER FUNCTION "public"."cost_invoice_build_search_document"("p_row" "public"."cost_invoices") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."cost_invoice_ci_dedupe_key"("p_company_invoice_key" "text", "p_invoice_number_key" "text") RETURNS "text"
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT CASE
+    WHEN p_company_invoice_key IS NULL OR btrim(p_company_invoice_key) = ''
+      OR p_invoice_number_key IS NULL
+      OR p_invoice_number_key IN ('NA','N/A','NO-NUMBER','NONUMBER','NO_NUMBER')
+    THEN NULL ELSE p_company_invoice_key || '|' || p_invoice_number_key END;
+$$;
+
+
+ALTER FUNCTION "public"."cost_invoice_ci_dedupe_key"("p_company_invoice_key" "text", "p_invoice_number_key" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."cost_invoice_full_field_dedupe_key"("p_company_name" "text", "p_invoice_number" "text", "p_po_reference" "text", "p_invoice_date" "date", "p_due_date" "date", "p_description" "text", "p_net_amount" numeric, "p_vat_amount" numeric, "p_total_amount" numeric, "p_vat_treatment" "text", "p_currency" "text") RETURNS "text"
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT nullif(regexp_replace(concat_ws('|',
+    public.cost_invoice_norm_text(p_company_name),
+    public.cost_invoice_norm_text(p_invoice_number),
+    public.cost_invoice_norm_text(p_po_reference),
+    public.cost_invoice_norm_text(to_char(p_invoice_date, 'YYYY-MM-DD')),
+    public.cost_invoice_norm_text(to_char(p_due_date, 'YYYY-MM-DD')),
+    public.cost_invoice_norm_text(p_description),
+    public.cost_invoice_norm_amount(p_net_amount),
+    public.cost_invoice_norm_amount(p_vat_amount),
+    public.cost_invoice_norm_amount(p_total_amount),
+    public.cost_invoice_norm_text(p_vat_treatment),
+    public.cost_invoice_norm_text(p_currency)
+  ), '\|', '', 'g'), '');
+$$;
+
+
+ALTER FUNCTION "public"."cost_invoice_full_field_dedupe_key"("p_company_name" "text", "p_invoice_number" "text", "p_po_reference" "text", "p_invoice_date" "date", "p_due_date" "date", "p_description" "text", "p_net_amount" numeric, "p_vat_amount" numeric, "p_total_amount" numeric, "p_vat_treatment" "text", "p_currency" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."cost_invoice_invoice_project_label"("p_project_id" "uuid", "p_project_other" "text", "p_is_overhead" boolean, "p_project_code" "text", "p_project_description" "text") RETURNS "text"
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT CASE
+    WHEN coalesce(p_is_overhead, false) THEN 'Overhead'
+    WHEN p_project_id IS NOT NULL THEN
+      CASE
+        WHEN coalesce(p_project_description, '') <> '' THEN p_project_code || ' — ' || p_project_description
+        ELSE p_project_code
+      END
+    ELSE nullif(p_project_other, '')
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."cost_invoice_invoice_project_label"("p_project_id" "uuid", "p_project_other" "text", "p_is_overhead" boolean, "p_project_code" "text", "p_project_description" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."cost_invoice_matches_project"("p_invoice" "public"."cost_invoices", "p_split_project_id" "uuid", "p_split_project_other" "text", "p_split_is_overhead" boolean, "p_f_project" "text") RETURNS boolean
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT CASE
+    WHEN coalesce(nullif(trim(p_f_project), ''), NULL) IS NULL THEN true
+    WHEN left(p_f_project, 6) = 'other:' THEN
+      (
+        p_invoice.project_id IS NULL
+        AND NOT coalesce(p_invoice.is_overhead, false)
+        AND coalesce(p_invoice.project_other, '') = substring(p_f_project FROM 7)
+      )
+      OR (
+        p_split_project_id IS NULL
+        AND NOT coalesce(p_split_is_overhead, false)
+        AND coalesce(p_split_project_other, '') = substring(p_f_project FROM 7)
+      )
+    ELSE
+      p_invoice.project_id::text = p_f_project
+      OR p_split_project_id::text = p_f_project
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."cost_invoice_matches_project"("p_invoice" "public"."cost_invoices", "p_split_project_id" "uuid", "p_split_project_other" "text", "p_split_is_overhead" boolean, "p_f_project" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."cost_invoice_norm_amount"("p_value" numeric) RETURNS "text"
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT CASE
+    WHEN p_value IS NULL THEN ''
+    ELSE to_char(p_value, 'FM999999990.00')
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."cost_invoice_norm_amount"("p_value" numeric) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."cost_invoice_norm_text"("p_value" "text") RETURNS "text"
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT lower(trim(coalesce(p_value, '')));
+$$;
+
+
+ALTER FUNCTION "public"."cost_invoice_norm_text"("p_value" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public"."cost_invoices", "p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean) RETURNS boolean
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    (NOT p_dup_only OR p_ci.is_duplicate OR p_ci.has_duplicate_siblings)
+    AND (NOT p_missing_due_date OR p_ci.due_date IS NULL)
+    AND (coalesce(nullif(trim(p_f_treatment), ''), NULL) IS NULL OR p_ci.vat_treatment::text = p_f_treatment)
+    AND (coalesce(nullif(trim(p_f_status), ''), NULL) IS NULL OR p_ci.status::text = p_f_status)
+    AND (
+      coalesce(nullif(trim(p_f_doc_type), ''), NULL) IS NULL
+      OR (p_f_doc_type = 'invoice' AND (p_ci.document_type = 'invoice' OR p_ci.document_type IS NULL))
+      OR (p_f_doc_type <> 'invoice' AND p_ci.document_type = p_f_doc_type)
+    )
+    AND (
+      coalesce(nullif(trim(p_f_company), ''), NULL) IS NULL
+      OR p_ci.company_name ILIKE p_f_company
+    )
+    AND (p_f_from IS NULL OR p_ci.invoice_date >= p_f_from)
+    AND (p_f_to IS NULL OR p_ci.invoice_date <= p_f_to)
+    AND (
+      coalesce(nullif(trim(p_f_po), ''), NULL) IS NULL
+      OR p_ci.po_reference ILIKE '%' || trim(p_f_po) || '%'
+    )
+    AND (p_f_due_from IS NULL OR p_ci.due_date >= p_f_due_from)
+    AND (p_f_due_to IS NULL OR p_ci.due_date <= p_f_due_to)
+    AND (
+      coalesce(nullif(trim(p_f_paid), ''), NULL) IS NULL
+      OR (p_f_paid = 'paid' AND p_ci.paid_at IS NOT NULL)
+      OR (p_f_paid = 'unpaid' AND p_ci.paid_at IS NULL)
+    )
+    AND (
+      coalesce(nullif(trim(p_f_cis), ''), NULL) IS NULL
+      OR (p_f_cis = 'has' AND coalesce(p_ci.cis_amount, 0) > 0)
+      OR (p_f_cis = 'none' AND (p_ci.cis_amount IS NULL OR p_ci.cis_amount = 0))
+    )
+    AND (
+      coalesce(nullif(trim(p_f_check), ''), NULL) IS NULL
+      OR (p_f_check = 'match' AND p_ci.timesheet_check_status = 'match')
+      OR (p_f_check = 'mismatch' AND p_ci.timesheet_check_status = 'mismatch')
+      OR (
+        p_f_check = 'unchecked'
+        AND (p_ci.timesheet_check_status IS NULL OR p_ci.timesheet_check_status = 'unchecked')
+      )
+    )
+    AND (
+      coalesce(nullif(trim(p_f_project), ''), NULL) IS NULL
+      OR public.cost_invoice_matches_project(p_ci, NULL, NULL, false, p_f_project)
+      OR EXISTS (
+        SELECT 1
+        FROM public.cost_invoice_splits s
+        WHERE s.cost_invoice_id = p_ci.id
+          AND public.cost_invoice_matches_project(
+            p_ci, s.project_id, s.project_other, s.is_overhead, p_f_project
+          )
+      )
+    )
+    AND (
+      coalesce(nullif(trim(p_f_text), ''), NULL) IS NULL
+      OR p_ci.search_document @@ plainto_tsquery('english', trim(p_f_text))
+      OR EXISTS (
+        SELECT 1
+        FROM public.cost_invoice_splits s
+        LEFT JOIN public.projects sp ON sp.id = s.project_id
+        WHERE s.cost_invoice_id = p_ci.id
+          AND lower(
+            concat_ws(
+              ' ',
+              s.description,
+              public.cost_invoice_invoice_project_label(
+                s.project_id, s.project_other, s.is_overhead, sp.code, sp.description
+              )
+            )
+          ) LIKE '%' || lower(trim(p_f_text)) || '%'
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM public.projects ip
+        WHERE ip.id = p_ci.project_id
+          AND lower(
+            public.cost_invoice_invoice_project_label(
+              p_ci.project_id, p_ci.project_other, p_ci.is_overhead, ip.code, ip.description
+            )
+          ) LIKE '%' || lower(trim(p_f_text)) || '%'
+      )
+    )
+    AND (
+      cardinality(public.parse_description_filter_terms(p_f_description)) = 0
+      OR EXISTS (
+        SELECT 1
+        FROM public.cost_invoice_splits s
+        WHERE s.cost_invoice_id = p_ci.id
+          AND public.split_line_matches_description_filter(s.description, p_f_description)
+      )
+    );
+$$;
+
+
+ALTER FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public"."cost_invoices", "p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."cost_invoice_sort_value"("p_row" "public"."cost_invoices", "p_sort_key" "text") RETURNS "text"
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT CASE p_sort_key
+    WHEN 'received' THEN p_row.source_received_at::text
+    WHEN 'invoice_date' THEN p_row.invoice_date::text
+    WHEN 'due_date' THEN p_row.due_date::text
+    WHEN 'paid' THEN p_row.paid_at::text
+    WHEN 'net_amount' THEN p_row.net_amount::text
+    WHEN 'vat_amount' THEN p_row.vat_amount::text
+    WHEN 'cis_amount' THEN p_row.cis_amount::text
+    WHEN 'total_amount' THEN p_row.total_amount::text
+    WHEN 'company_name' THEN
+      CASE
+        WHEN p_row.company_name IS NULL OR btrim(p_row.company_name) = '' OR upper(btrim(p_row.company_name)) = 'NA'
+        THEN NULL
+        ELSE lower(btrim(p_row.company_name))
+      END
+    WHEN 'invoice_number' THEN
+      CASE
+        WHEN p_row.invoice_number IS NULL OR btrim(p_row.invoice_number) = '' OR upper(btrim(p_row.invoice_number)) = 'NA'
+        THEN NULL
+        ELSE lower(btrim(p_row.invoice_number))
+      END
+    WHEN 'po_reference' THEN
+      CASE
+        WHEN p_row.po_reference IS NULL OR btrim(p_row.po_reference) = '' OR upper(btrim(p_row.po_reference)) = 'NA'
+        THEN NULL
+        ELSE lower(btrim(p_row.po_reference))
+      END
+    WHEN 'description' THEN
+      CASE
+        WHEN p_row.description IS NULL OR btrim(p_row.description) = '' OR upper(btrim(p_row.description)) = 'NA'
+        THEN NULL
+        ELSE lower(btrim(p_row.description))
+      END
+    WHEN 'vat_treatment' THEN lower(p_row.vat_treatment::text)
+    WHEN 'status' THEN lower(p_row.status::text)
+    ELSE NULL
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."cost_invoice_sort_value"("p_row" "public"."cost_invoices", "p_sort_key" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."cost_invoices_after_write_refresh_duplicate_flags"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_full_keys text[] := ARRAY[]::text[];
+  v_ci_keys text[] := ARRAY[]::text[];
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    IF OLD.full_field_dedupe_key IS NOT NULL THEN
+      v_full_keys := array_append(v_full_keys, OLD.full_field_dedupe_key);
+    END IF;
+    IF public.cost_invoice_ci_dedupe_key(OLD.company_invoice_key, OLD.invoice_number_key) IS NOT NULL THEN
+      v_ci_keys := array_append(
+        v_ci_keys,
+        public.cost_invoice_ci_dedupe_key(OLD.company_invoice_key, OLD.invoice_number_key)
+      );
+    END IF;
+  ELSE
+    IF NEW.full_field_dedupe_key IS NOT NULL THEN
+      v_full_keys := array_append(v_full_keys, NEW.full_field_dedupe_key);
+    END IF;
+    IF public.cost_invoice_ci_dedupe_key(NEW.company_invoice_key, NEW.invoice_number_key) IS NOT NULL THEN
+      v_ci_keys := array_append(
+        v_ci_keys,
+        public.cost_invoice_ci_dedupe_key(NEW.company_invoice_key, NEW.invoice_number_key)
+      );
+    END IF;
+    IF TG_OP = 'UPDATE' THEN
+      IF OLD.full_field_dedupe_key IS DISTINCT FROM NEW.full_field_dedupe_key
+         AND OLD.full_field_dedupe_key IS NOT NULL THEN
+        v_full_keys := array_append(v_full_keys, OLD.full_field_dedupe_key);
+      END IF;
+      IF public.cost_invoice_ci_dedupe_key(OLD.company_invoice_key, OLD.invoice_number_key)
+         IS DISTINCT FROM public.cost_invoice_ci_dedupe_key(NEW.company_invoice_key, NEW.invoice_number_key)
+         AND public.cost_invoice_ci_dedupe_key(OLD.company_invoice_key, OLD.invoice_number_key) IS NOT NULL THEN
+        v_ci_keys := array_append(
+          v_ci_keys,
+          public.cost_invoice_ci_dedupe_key(OLD.company_invoice_key, OLD.invoice_number_key)
+        );
+      END IF;
+    END IF;
+  END IF;
+
+  PERFORM public.refresh_cost_invoice_duplicate_flags(
+    (SELECT coalesce(array_agg(DISTINCT k), ARRAY[]::text[]) FROM unnest(v_full_keys) AS k WHERE k IS NOT NULL),
+    (SELECT coalesce(array_agg(DISTINCT k), ARRAY[]::text[]) FROM unnest(v_ci_keys) AS k WHERE k IS NOT NULL)
+  );
+
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."cost_invoices_after_write_refresh_duplicate_flags"() OWNER TO "postgres";
+
 
 CREATE OR REPLACE FUNCTION "public"."cost_invoices_apply_canonical_company"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
@@ -367,6 +1011,111 @@ END; $$;
 ALTER FUNCTION "public"."cost_invoices_apply_canonical_company"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."cost_invoices_search_document_trigger"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  NEW.search_document := public.cost_invoice_build_search_document(NEW);
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."cost_invoices_search_document_trigger"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."cost_invoices_set_full_field_dedupe_key_trigger"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  NEW.full_field_dedupe_key := public.cost_invoice_full_field_dedupe_key(
+    NEW.company_name,
+    NEW.invoice_number,
+    NEW.po_reference,
+    NEW.invoice_date,
+    NEW.due_date,
+    NEW.description,
+    NEW.net_amount,
+    NEW.vat_amount,
+    NEW.total_amount,
+    NEW.vat_treatment::text,
+    NEW.currency
+  );
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."cost_invoices_set_full_field_dedupe_key_trigger"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."count_pending_timesheet_reviews"() RETURNS bigint
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_sub uuid;
+  v_count bigint;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN 0;
+  END IF;
+
+  IF NOT (
+    public.has_role(v_uid, 'manager'::public.app_role)
+    OR public.has_role(v_uid, 'admin'::public.app_role)
+    OR public.has_role(v_uid, 'super_admin'::public.app_role)
+  ) THEN
+    RETURN 0;
+  END IF;
+
+  IF public.has_role(v_uid, 'admin'::public.app_role)
+     OR public.has_role(v_uid, 'super_admin'::public.app_role) THEN
+    SELECT count(*)::bigint INTO v_count
+    FROM public.timesheets t
+    WHERE t.status = 'submitted'::public.submission_status
+      AND t.worker_id <> v_uid
+      AND NOT EXISTS (
+        SELECT 1
+        FROM public.user_roles ur
+        WHERE ur.user_id = t.worker_id
+          AND ur.role IN ('admin'::public.app_role, 'super_admin'::public.app_role)
+      );
+    RETURN v_count;
+  END IF;
+
+  SELECT p.subcontractor_id INTO v_sub
+  FROM public.profiles p
+  WHERE p.id = v_uid;
+
+  IF v_sub IS NULL THEN
+    RETURN 0;
+  END IF;
+
+  SELECT count(*)::bigint INTO v_count
+  FROM public.timesheets t
+  JOIN public.profiles p ON p.id = t.worker_id
+  WHERE t.status = 'submitted'::public.submission_status
+    AND p.subcontractor_id = v_sub
+    AND t.worker_id <> v_uid
+    AND NOT EXISTS (
+      SELECT 1
+      FROM public.user_roles ur
+      WHERE ur.user_id = t.worker_id
+        AND ur.role IN ('admin'::public.app_role, 'super_admin'::public.app_role)
+    );
+
+  RETURN v_count;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."count_pending_timesheet_reviews"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."daily_briefing_autoapprove"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -378,6 +1127,39 @@ $$;
 
 
 ALTER FUNCTION "public"."daily_briefing_autoapprove"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."delete_cost_payment_remittances_for_invoices"("p_invoice_ids" "uuid"[]) RETURNS integer
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  deleted_count integer;
+BEGIN
+  IF p_invoice_ids IS NULL OR cardinality(p_invoice_ids) = 0 THEN
+    RETURN 0;
+  END IF;
+
+  WITH doomed AS (
+    SELECT r.id
+    FROM public.cost_payment_remittances r
+    WHERE EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(r.lines) elem
+      WHERE (elem->>'invoice_id')::uuid = ANY (p_invoice_ids)
+    )
+  )
+  DELETE FROM public.cost_payment_remittances r
+  USING doomed d
+  WHERE r.id = d.id;
+
+  GET DIAGNOSTICS deleted_count = ROW_COUNT;
+  RETURN deleted_count;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."delete_cost_payment_remittances_for_invoices"("p_invoice_ids" "uuid"[]) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."delete_integration_secret"("p_name" "text") RETURNS "void"
@@ -677,6 +1459,54 @@ $$;
 ALTER FUNCTION "public"."holidays_prevent_overlap"() OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."invoices" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "invoice_number" integer NOT NULL,
+    "invoice_date" "date" DEFAULT CURRENT_DATE NOT NULL,
+    "due_date" "date" NOT NULL,
+    "client_id" "uuid",
+    "client_name_snapshot" "text" DEFAULT ''::"text" NOT NULL,
+    "client_address_snapshot" "text" DEFAULT ''::"text" NOT NULL,
+    "client_reference" "text",
+    "purchase_order" "text",
+    "site_name" "text",
+    "description" "text",
+    "amount_net" numeric(12,2) DEFAULT 0 NOT NULL,
+    "vat_mode" "public"."invoice_vat_mode" DEFAULT 'reverse_charge'::"public"."invoice_vat_mode" NOT NULL,
+    "nas_path" "text",
+    "nas_pushed_at" timestamp with time zone,
+    "created_by" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "search_document" "tsvector"
+);
+
+
+ALTER TABLE "public"."invoices" OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."invoice_build_search_document"("p_row" "public"."invoices") RETURNS "tsvector"
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT to_tsvector(
+    'english',
+    concat_ws(
+      ' ',
+      p_row.invoice_number::text,
+      p_row.client_name_snapshot,
+      p_row.client_reference,
+      p_row.purchase_order,
+      p_row.site_name,
+      p_row.description
+    )
+  );
+$$;
+
+
+ALTER FUNCTION "public"."invoice_build_search_document"("p_row" "public"."invoices") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."invoice_format_key"("p_invoice_number" "text") RETURNS "text"
     LANGUAGE "plpgsql" IMMUTABLE
     SET "search_path" TO 'public'
@@ -728,6 +1558,20 @@ $$;
 
 
 ALTER FUNCTION "public"."invoices_before_insert"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."invoices_search_document_trigger"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  NEW.search_document := public.invoice_build_search_document(NEW);
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."invoices_search_document_trigger"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."is_assigned_to_project"("_user_id" "uuid", "_project_id" "uuid") RETURNS boolean
@@ -844,6 +1688,458 @@ $$;
 ALTER FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."list_cost_duplicate_id_sets"() RETURNS TABLE("dup_ids" "uuid"[], "original_ids" "uuid"[])
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    coalesce(array_agg(id) FILTER (WHERE is_duplicate), '{}'::uuid[]),
+    coalesce(array_agg(id) FILTER (WHERE has_duplicate_siblings), '{}'::uuid[])
+  FROM public.cost_invoices
+$$;
+
+
+ALTER FUNCTION "public"."list_cost_duplicate_id_sets"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT ''::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_sort_key" "text" DEFAULT 'received'::"text", "p_sort_dir" "text" DEFAULT 'desc'::"text", "p_f_company_exact" "text" DEFAULT NULL::"text") RETURNS TABLE("id" "uuid")
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT ci.id
+  FROM public.cost_invoices ci
+  WHERE public.cost_invoice_passes_filters(
+    ci,
+    p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type,
+    coalesce(p_f_company_exact, p_f_company),
+    p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
+    p_f_project, p_f_check, p_dup_only, p_missing_due_date
+  )
+  ORDER BY
+    CASE WHEN public.cost_invoice_sort_value(ci, p_sort_key) IS NULL THEN 1 ELSE 0 END,
+    CASE WHEN p_sort_dir = 'asc' THEN public.cost_invoice_sort_value(ci, p_sort_key) END ASC NULLS LAST,
+    CASE WHEN p_sort_dir = 'desc' THEN public.cost_invoice_sort_value(ci, p_sort_key) END DESC NULLS LAST,
+    CASE WHEN p_sort_key = 'received' THEN ci.created_at END DESC NULLS LAST,
+    ci.id ASC;
+$$;
+
+
+ALTER FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_f_company_exact" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."list_cost_invoices"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT ''::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_sort_key" "text" DEFAULT 'received'::"text", "p_sort_dir" "text" DEFAULT 'desc'::"text", "p_limit" integer DEFAULT 20, "p_offset" integer DEFAULT 0, "p_unpaginated" boolean DEFAULT false, "p_cursor_sort_value" "text" DEFAULT NULL::"text", "p_cursor_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "status" "public"."cost_invoice_status", "company_name" "text", "company_name_raw" "text", "invoice_number" "text", "po_reference" "text", "invoice_date" "date", "due_date" "date", "due_date_rule" "text", "description" "text", "currency" "text", "net_amount" numeric, "vat_amount" numeric, "total_amount" numeric, "vat_treatment" "public"."cost_vat_treatment", "nas_path" "text", "nas_fallback_path" "text", "attachment_filename" "text", "attachment_sha256" "text", "source_email_from" "text", "source_subject" "text", "source_message_id" "text", "source_received_at" timestamp with time zone, "gemini_confidence" numeric, "is_duplicate" boolean, "duplicate_of" "uuid", "has_duplicate_siblings" boolean, "notes" "text", "created_at" timestamp with time zone, "updated_at" timestamp with time zone, "paid_at" timestamp with time zone, "cis_amount" numeric, "document_type" "text", "project_id" "uuid", "project_other" "text", "is_overhead" boolean, "subcontractor_id" "uuid", "timesheet_check_status" "text", "timesheet_check_at" timestamp with time zone, "timesheet_check_detail" "text", "company_invoice_key" "text", "invoice_number_key" "text", "invoice_format_key" "text", "supplier_email_domain" "text", "supplier_id" "uuid", "supplier_vat_number" "text", "supplier_company_reg_number" "text", "payment_reminded_at" timestamp with time zone, "full_field_dedupe_key" "text", "total_count" bigint)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  WITH filtered AS (
+    SELECT ci.*
+    FROM public.cost_invoices ci
+    WHERE public.cost_invoice_passes_filters(
+      ci,
+      p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type, p_f_company,
+      p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
+      p_f_project, p_f_check, p_dup_only, p_missing_due_date
+    )
+  ),
+  ranked AS (
+    SELECT
+      f.*,
+      count(*) OVER () AS total_count,
+      public.cost_invoice_sort_value(f, p_sort_key) AS sort_value
+    FROM filtered f
+  ),
+  ordered AS (
+    SELECT r.*
+    FROM ranked r
+    WHERE (
+      p_cursor_sort_value IS NULL
+      AND p_cursor_id IS NULL
+      AND NOT p_unpaginated
+    )
+    OR p_unpaginated
+    OR (
+      p_sort_dir = 'desc'
+      AND (
+        r.sort_value < p_cursor_sort_value
+        OR (r.sort_value IS NOT DISTINCT FROM p_cursor_sort_value AND r.id > p_cursor_id)
+        OR (r.sort_value IS NULL AND p_cursor_sort_value IS NOT NULL)
+        OR (r.sort_value IS NULL AND p_cursor_sort_value IS NULL AND r.id > p_cursor_id)
+      )
+    )
+    OR (
+      p_sort_dir = 'asc'
+      AND (
+        r.sort_value > p_cursor_sort_value
+        OR (r.sort_value IS NOT DISTINCT FROM p_cursor_sort_value AND r.id > p_cursor_id)
+        OR (r.sort_value IS NOT NULL AND p_cursor_sort_value IS NULL)
+        OR (r.sort_value IS NULL AND p_cursor_sort_value IS NULL AND r.id > p_cursor_id)
+      )
+    )
+    ORDER BY
+      CASE WHEN r.sort_value IS NULL THEN 1 ELSE 0 END,
+      CASE WHEN p_sort_dir = 'asc' THEN r.sort_value END ASC NULLS LAST,
+      CASE WHEN p_sort_dir = 'desc' THEN r.sort_value END DESC NULLS LAST,
+      CASE WHEN p_sort_key = 'received' THEN r.created_at END DESC NULLS LAST,
+      r.id ASC
+  )
+  SELECT
+    o.id, o.status, o.company_name, o.company_name_raw, o.invoice_number, o.po_reference,
+    o.invoice_date, o.due_date, o.due_date_rule, o.description, o.currency,
+    o.net_amount, o.vat_amount, o.total_amount, o.vat_treatment,
+    o.nas_path, o.nas_fallback_path, o.attachment_filename, o.attachment_sha256,
+    o.source_email_from, o.source_subject, o.source_message_id, o.source_received_at,
+    o.gemini_confidence, o.is_duplicate, o.duplicate_of, o.has_duplicate_siblings,
+    o.notes, o.created_at, o.updated_at, o.paid_at, o.cis_amount, o.document_type,
+    o.project_id, o.project_other, o.is_overhead, o.subcontractor_id,
+    o.timesheet_check_status, o.timesheet_check_at, o.timesheet_check_detail,
+    o.company_invoice_key, o.invoice_number_key, o.invoice_format_key,
+    o.supplier_email_domain, o.supplier_id, o.supplier_vat_number,
+    o.supplier_company_reg_number, o.payment_reminded_at, o.full_field_dedupe_key,
+    o.total_count
+  FROM ordered o
+  LIMIT CASE WHEN p_unpaginated THEN NULL ELSE GREATEST(p_limit, 0) END
+  OFFSET CASE
+    WHEN p_unpaginated THEN 0
+    WHEN p_cursor_sort_value IS NOT NULL OR p_cursor_id IS NOT NULL THEN 0
+    ELSE GREATEST(p_offset, 0)
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."list_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer, "p_unpaginated" boolean, "p_cursor_sort_value" "text", "p_cursor_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."list_cost_payment_remittances"("p_company" "text" DEFAULT ''::"text", "p_paid_from" "date" DEFAULT NULL::"date", "p_paid_to" "date" DEFAULT NULL::"date", "p_limit" integer DEFAULT 20, "p_offset" integer DEFAULT 0) RETURNS TABLE("id" "uuid", "company_name" "text", "paid_at" timestamp with time zone, "nas_path" "text", "total_net" numeric, "total_vat" numeric, "total_amount" numeric, "invoice_count" integer, "lines" "jsonb", "created_at" timestamp with time zone, "total_count" bigint)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  WITH filtered AS (
+    SELECT r.*
+    FROM public.cost_payment_remittances r
+    WHERE
+      (coalesce(nullif(trim(p_company), ''), NULL) IS NULL OR r.company_name = trim(p_company))
+      AND (p_paid_from IS NULL OR r.paid_at::date >= p_paid_from)
+      AND (p_paid_to IS NULL OR r.paid_at::date <= p_paid_to)
+  ),
+  counted AS (
+    SELECT count(*)::bigint AS cnt FROM filtered
+  )
+  SELECT
+    f.id,
+    f.company_name,
+    f.paid_at,
+    f.nas_path,
+    f.total_net,
+    f.total_vat,
+    f.total_amount,
+    f.invoice_count,
+    f.lines,
+    f.created_at,
+    c.cnt AS total_count
+  FROM filtered f
+  CROSS JOIN counted c
+  ORDER BY f.paid_at DESC, f.id DESC
+  LIMIT greatest(coalesce(p_limit, 20), 0)
+  OFFSET greatest(coalesce(p_offset, 0), 0);
+$$;
+
+
+ALTER FUNCTION "public"."list_cost_payment_remittances"("p_company" "text", "p_paid_from" "date", "p_paid_to" "date", "p_limit" integer, "p_offset" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."list_invoices"("p_f_text" "text" DEFAULT ''::"text", "p_f_client" "uuid" DEFAULT NULL::"uuid", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_vat" "text" DEFAULT ''::"text", "p_f_project" "uuid" DEFAULT NULL::"uuid", "p_sort_dir" "text" DEFAULT 'desc'::"text", "p_limit" integer DEFAULT 20, "p_offset" integer DEFAULT 0) RETURNS TABLE("id" "uuid", "invoice_number" integer, "invoice_date" "date", "due_date" "date", "client_id" "uuid", "client_name_snapshot" "text", "client_reference" "text", "purchase_order" "text", "site_name" "text", "description" "text", "amount_net" numeric, "display_net" numeric, "vat_mode" "public"."invoice_vat_mode", "nas_path" "text", "nas_pushed_at" timestamp with time zone, "created_at" timestamp with time zone, "line_count" integer, "total_count" bigint)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  WITH filtered AS (
+    SELECT i.*
+    FROM public.invoices i
+    WHERE public.outgoing_invoice_passes_filters(
+      i, p_f_text, p_f_client, p_f_from, p_f_to, p_f_vat, p_f_project
+    )
+  ),
+  ranked AS (
+    SELECT
+      f.*,
+      count(*) OVER () AS total_count,
+      CASE
+        WHEN p_f_project IS NOT NULL THEN (
+          SELECT coalesce(sum(il.amount_net), 0)
+          FROM public.invoice_lines il
+          WHERE il.invoice_id = f.id
+            AND il.project_id = p_f_project
+        )
+        ELSE coalesce(f.amount_net, 0)
+      END AS display_net,
+      (
+        SELECT count(*)::integer
+        FROM public.invoice_lines il
+        WHERE il.invoice_id = f.id
+      ) AS line_count
+    FROM filtered f
+  )
+  SELECT
+    r.id,
+    r.invoice_number,
+    r.invoice_date,
+    r.due_date,
+    r.client_id,
+    r.client_name_snapshot,
+    r.client_reference,
+    r.purchase_order,
+    r.site_name,
+    r.description,
+    r.amount_net,
+    r.display_net,
+    r.vat_mode,
+    r.nas_path,
+    r.nas_pushed_at,
+    r.created_at,
+    r.line_count,
+    r.total_count
+  FROM ranked r
+  ORDER BY
+    CASE WHEN p_sort_dir = 'asc' THEN r.invoice_number END ASC NULLS LAST,
+    CASE WHEN p_sort_dir = 'desc' THEN r.invoice_number END DESC NULLS LAST,
+    r.id ASC
+  LIMIT GREATEST(p_limit, 0)
+  OFFSET GREATEST(p_offset, 0);
+$$;
+
+
+ALTER FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid" DEFAULT NULL::"uuid", "p_group" "text" DEFAULT NULL::"text", "p_client" "uuid" DEFAULT NULL::"uuid", "p_search" "text" DEFAULT NULL::"text", "p_allowed_worker_ids" "uuid"[] DEFAULT NULL::"uuid"[], "p_limit" integer DEFAULT 20, "p_offset" integer DEFAULT 0) RETURNS TABLE("kind" "text", "id" "uuid", "worker_id" "uuid", "who" "text", "group_name" "text", "label" "text", "status" "text", "when_at" timestamp with time zone, "client_id" "uuid", "client_ids" "uuid"[], "repaired" boolean, "total_count" bigint)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  WITH base AS (
+    SELECT
+      'timesheet'::text AS kind,
+      t.id,
+      t.worker_id,
+      COALESCE(p.full_name, p.username, 'Unknown') AS who,
+      s.name AS group_name,
+      'Week ending ' || to_char(t.week_ending::date, 'DD Mon YYYY') AS label,
+      t.status::text AS status,
+      t.created_at AS when_at,
+      NULL::uuid AS client_id,
+      COALESCE((
+        SELECT array_agg(DISTINCT pr.client_id) FILTER (WHERE pr.client_id IS NOT NULL)
+        FROM public.timesheet_days td
+        JOIN public.projects pr ON pr.id = td.project_id
+        WHERE td.timesheet_id = t.id
+      ), ARRAY[]::uuid[]) AS client_ids,
+      false AS repaired
+    FROM public.timesheets t
+    LEFT JOIN public.profiles p ON p.id = t.worker_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE t.week_ending >= p_from
+      AND t.week_ending <= p_to
+      AND ('timesheet' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'plant_inspection',
+      pi.id,
+      pi.worker_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'Plant: ' || COALESCE(pi.plant_description, ''),
+      pi.status::text,
+      pi.created_at,
+      pi.client_id,
+      CASE WHEN pi.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[pi.client_id] END,
+      EXISTS (
+        SELECT 1 FROM public.plant_inspection_items pii
+        WHERE pii.inspection_id = pi.id AND pii.repaired_at IS NOT NULL
+      )
+    FROM public.plant_inspections pi
+    LEFT JOIN public.profiles p ON p.id = pi.worker_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE pi.inspection_date >= p_from
+      AND pi.inspection_date <= p_to
+      AND ('plant_inspection' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'vehicle_defect',
+      vd.id,
+      vd.worker_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'Vehicle: ' || COALESCE(vd.vehicle_registration, ''),
+      vd.status::text,
+      vd.created_at,
+      NULL::uuid,
+      ARRAY[]::uuid[],
+      EXISTS (
+        SELECT 1 FROM public.vehicle_defect_items vdi
+        WHERE vdi.defect_id = vd.id AND vdi.repaired_at IS NOT NULL
+      )
+    FROM public.vehicle_defects vd
+    LEFT JOIN public.profiles p ON p.id = vd.worker_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE vd.inspection_date >= p_from
+      AND vd.inspection_date <= p_to
+      AND ('vehicle_defect' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'rams_briefing',
+      rb.id,
+      rb.briefer_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'RAMS: ' || COALESCE(rb.method_statement_title, ''),
+      rb.status::text,
+      rb.created_at,
+      rb.client_id,
+      CASE WHEN rb.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[rb.client_id] END,
+      false
+    FROM public.rams_briefings rb
+    LEFT JOIN public.profiles p ON p.id = rb.briefer_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE rb.briefing_date >= p_from
+      AND rb.briefing_date <= p_to
+      AND ('rams_briefing' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'havs_log',
+      hl.id,
+      hl.worker_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'HAVS · ' || COALESCE(hl.total_points::text, '0') || ' pts',
+      hl.status::text,
+      hl.created_at,
+      hl.client_id,
+      CASE WHEN hl.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[hl.client_id] END,
+      false
+    FROM public.havs_logs hl
+    LEFT JOIN public.profiles p ON p.id = hl.worker_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE hl.log_date >= p_from
+      AND hl.log_date <= p_to
+      AND ('havs_log' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'toolbox_talk',
+      tt.id,
+      tt.briefer_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'Toolbox: ' || COALESCE(tt.topic, ''),
+      tt.status::text,
+      tt.created_at,
+      tt.client_id,
+      CASE WHEN tt.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[tt.client_id] END,
+      false
+    FROM public.toolbox_talks tt
+    LEFT JOIN public.profiles p ON p.id = tt.briefer_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE tt.talk_date >= p_from
+      AND tt.talk_date <= p_to
+      AND ('toolbox_talk' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'daily_briefing',
+      db.id,
+      db.briefer_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'Daily Briefing · ' || to_char(db.time_delivered, 'DD Mon YYYY HH24:MI'),
+      db.status::text,
+      db.created_at,
+      db.client_id,
+      CASE WHEN db.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[db.client_id] END,
+      false
+    FROM public.daily_briefings db
+    LEFT JOIN public.profiles p ON p.id = db.briefer_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE db.time_delivered >= (p_from::timestamptz)
+      AND db.time_delivered <= ((p_to::text || 'T23:59:59')::timestamptz)
+      AND ('daily_briefing' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'starter',
+      es.id,
+      es.user_id,
+      CASE
+        WHEN es.user_id IS NULL THEN '(deleted user)'
+        ELSE COALESCE(p.full_name, p.username, 'Unknown')
+      END,
+      s.name,
+      'Starter form · ' || COALESCE(es.full_name, '') || ' (v' || COALESCE(es.revision, 1)::text || ')',
+      CASE WHEN es.submitted_at IS NOT NULL THEN 'submitted' ELSE 'draft' END,
+      COALESCE(es.submitted_at, es.created_at),
+      NULL::uuid,
+      ARRAY[]::uuid[],
+      false
+    FROM public.employee_starters es
+    LEFT JOIN public.profiles p ON p.id = es.user_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE es.created_at >= p_from::timestamptz
+      AND es.created_at <= ((p_to::text || 'T23:59:59')::timestamptz)
+      AND ('starter' = ANY (p_kinds))
+  ),
+  filtered AS (
+    SELECT *
+    FROM base b
+    WHERE (p_worker_id IS NULL OR b.worker_id = p_worker_id)
+      AND (p_allowed_worker_ids IS NULL OR b.worker_id = ANY (p_allowed_worker_ids))
+      AND (COALESCE(NULLIF(trim(p_group), ''), NULL) IS NULL OR b.group_name = p_group)
+      AND (
+        p_client IS NULL
+        OR (b.kind = 'timesheet' AND p_client = ANY (b.client_ids))
+        OR (b.kind <> 'timesheet' AND b.client_id = p_client)
+      )
+      AND (
+        COALESCE(NULLIF(trim(p_search), ''), NULL) IS NULL
+        OR lower(b.label || ' ' || b.who || ' ' || COALESCE(b.group_name, '')) LIKE '%' || lower(trim(p_search)) || '%'
+      )
+  ),
+  ranked AS (
+    SELECT
+      f.*,
+      count(*) OVER () AS total_count
+    FROM filtered f
+    ORDER BY f.when_at DESC
+    LIMIT GREATEST(p_limit, 0)
+    OFFSET GREATEST(p_offset, 0)
+  )
+  SELECT
+    r.kind,
+    r.id,
+    r.worker_id,
+    r.who,
+    r.group_name,
+    r.label,
+    r.status,
+    r.when_at,
+    r.client_id,
+    r.client_ids,
+    r.repaired,
+    r.total_count
+  FROM ranked r;
+$$;
+
+
+ALTER FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer) OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") RETURNS TABLE("supplier_id" "uuid", "canonical_name" "text")
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -870,6 +2166,60 @@ END; $$;
 
 
 ALTER FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT 'unpaid'::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_paid" boolean DEFAULT true, "p_selected_ids" "uuid"[] DEFAULT NULL::"uuid"[]) RETURNS TABLE("updated_count" bigint, "snapshot" "jsonb")
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_now timestamptz := now();
+BEGIN
+  RETURN QUERY
+  WITH targets AS (
+    SELECT ci.id, ci.paid_at, ci.company_name
+    FROM public.cost_invoices ci
+    WHERE ci.paid_at IS NULL
+      AND (p_selected_ids IS NULL OR ci.id = ANY (p_selected_ids))
+      AND public.cost_invoice_passes_filters(
+        ci,
+        p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type, p_f_company,
+        p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
+        p_f_project, p_f_check, p_dup_only, p_missing_due_date
+      )
+  ),
+  snap AS (
+    SELECT coalesce(
+      jsonb_agg(jsonb_build_object('id', t.id, 'paid_at', t.paid_at)),
+      '[]'::jsonb
+    ) AS entries
+    FROM targets t
+  ),
+  upd AS (
+    UPDATE public.cost_invoices ci
+    SET paid_at = CASE WHEN p_paid THEN v_now ELSE NULL END
+    FROM targets t
+    WHERE ci.id = t.id
+    RETURNING ci.id
+  ),
+  clear_reminders AS (
+    UPDATE public.cost_invoices ci
+    SET
+      payment_reminded_at = NULL,
+      payment_reminder_month = NULL,
+      payment_reminder_dismissed_at = NULL
+    FROM targets t
+    WHERE p_paid AND ci.id = t.id
+    RETURNING ci.id
+  )
+  SELECT
+    (SELECT count(*)::bigint FROM upd),
+    (SELECT entries FROM snap);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[]) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."match_subcontractor_by_company"("p_company" "text") RETURNS "uuid"
@@ -971,6 +2321,51 @@ $$;
 ALTER FUNCTION "public"."normalize_vat_number"("p_vat" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text" DEFAULT ''::"text", "p_f_client" "uuid" DEFAULT NULL::"uuid", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_vat" "text" DEFAULT ''::"text", "p_f_project" "uuid" DEFAULT NULL::"uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    (p_f_client IS NULL OR p_inv.client_id = p_f_client)
+    AND (p_f_from IS NULL OR p_inv.invoice_date >= p_f_from)
+    AND (p_f_to IS NULL OR p_inv.invoice_date <= p_f_to)
+    AND (
+      coalesce(trim(p_f_vat), '') = ''
+      OR p_inv.vat_mode::text = trim(p_f_vat)
+    )
+    AND (
+      p_f_project IS NULL
+      OR EXISTS (
+        SELECT 1
+        FROM public.invoice_lines il
+        WHERE il.invoice_id = p_inv.id
+          AND il.project_id = p_f_project
+      )
+    )
+    AND (
+      coalesce(trim(p_f_text), '') = ''
+      OR p_inv.search_document @@ plainto_tsquery('english', trim(p_f_text))
+      OR p_inv.invoice_number::text ILIKE '%' || trim(p_f_text) || '%'
+      OR EXISTS (
+        SELECT 1
+        FROM public.invoice_lines il
+        LEFT JOIN public.projects p ON p.id = il.project_id
+        WHERE il.invoice_id = p_inv.id
+          AND (
+            il.site_name ILIKE '%' || trim(p_f_text) || '%'
+            OR il.description ILIKE '%' || trim(p_f_text) || '%'
+            OR il.project_other ILIKE '%' || trim(p_f_text) || '%'
+            OR p.code ILIKE '%' || trim(p_f_text) || '%'
+            OR p.description ILIKE '%' || trim(p_f_text) || '%'
+          )
+      )
+    );
+$$;
+
+
+ALTER FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."owns_submission"("_kind" "public"."submission_kind", "_submission_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -989,6 +2384,25 @@ $$;
 
 
 ALTER FUNCTION "public"."owns_submission"("_kind" "public"."submission_kind", "_submission_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."parse_description_filter_terms"("p_f_description" "text") RETURNS "text"[]
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT CASE
+    WHEN coalesce(nullif(trim(p_f_description), ''), NULL) IS NULL THEN ARRAY[]::text[]
+    WHEN left(trim(p_f_description), 1) = '[' THEN (
+      SELECT coalesce(array_agg(trim(elem)), ARRAY[]::text[])
+      FROM jsonb_array_elements_text(p_f_description::jsonb) AS elem
+      WHERE trim(elem) <> ''
+    )
+    ELSE ARRAY[trim(p_f_description)]
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."parse_description_filter_terms"("p_f_description" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."pick_domain_canonical"("p_domain" "text") RETURNS "text"
@@ -1042,6 +2456,121 @@ $$;
 
 
 ALTER FUNCTION "public"."profiles_guard_sensitive_self_update"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."refresh_cost_invoice_duplicate_flags"("p_full_keys" "text"[] DEFAULT NULL::"text"[], "p_ci_keys" "text"[] DEFAULT NULL::"text"[]) RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_full_keys text[];
+  v_ci_keys text[];
+  v_full_refresh boolean;
+BEGIN
+  v_full_refresh := p_full_keys IS NULL AND p_ci_keys IS NULL;
+
+  IF v_full_refresh THEN
+    v_full_keys := NULL;
+    v_ci_keys := NULL;
+  ELSE
+    v_full_keys := (
+      SELECT coalesce(array_agg(DISTINCT k), ARRAY[]::text[])
+      FROM unnest(coalesce(p_full_keys, ARRAY[]::text[])) AS k
+      WHERE k IS NOT NULL
+    );
+    v_ci_keys := (
+      SELECT coalesce(array_agg(DISTINCT k), ARRAY[]::text[])
+      FROM unnest(coalesce(p_ci_keys, ARRAY[]::text[])) AS k
+      WHERE k IS NOT NULL
+    );
+    IF cardinality(v_full_keys) = 0 AND cardinality(v_ci_keys) = 0 THEN
+      RETURN;
+    END IF;
+  END IF;
+
+  UPDATE public.cost_invoices ci
+  SET
+    is_duplicate = false,
+    duplicate_of = NULL,
+    has_duplicate_siblings = false
+  WHERE v_full_refresh
+     OR ci.full_field_dedupe_key = ANY (v_full_keys)
+     OR public.cost_invoice_ci_dedupe_key(ci.company_invoice_key, ci.invoice_number_key) = ANY (v_ci_keys);
+
+  WITH full_ranked AS (
+    SELECT
+      ci.id,
+      first_value(ci.id) OVER w AS keeper_id,
+      count(*) OVER w AS grp_size
+    FROM public.cost_invoices ci
+    WHERE ci.full_field_dedupe_key IS NOT NULL
+      AND (
+        v_full_refresh
+        OR ci.full_field_dedupe_key = ANY (v_full_keys)
+      )
+    WINDOW w AS (
+      PARTITION BY ci.full_field_dedupe_key
+      ORDER BY ci.created_at ASC NULLS LAST, ci.id ASC
+    )
+  ),
+  ci_ranked AS (
+    SELECT
+      ci.id,
+      first_value(ci.id) OVER w AS keeper_id,
+      count(*) OVER w AS grp_size
+    FROM public.cost_invoices ci
+    WHERE public.cost_invoice_ci_dedupe_key(ci.company_invoice_key, ci.invoice_number_key) IS NOT NULL
+      AND (
+        v_full_refresh
+        OR public.cost_invoice_ci_dedupe_key(ci.company_invoice_key, ci.invoice_number_key) = ANY (v_ci_keys)
+      )
+    WINDOW w AS (
+      PARTITION BY public.cost_invoice_ci_dedupe_key(ci.company_invoice_key, ci.invoice_number_key)
+      ORDER BY ci.created_at ASC NULLS LAST, ci.id ASC
+    )
+  ),
+  duplicate_rows AS (
+    SELECT fr.id, fr.keeper_id
+    FROM full_ranked fr
+    WHERE fr.grp_size >= 2 AND fr.id <> fr.keeper_id
+    UNION
+    SELECT cr.id, cr.keeper_id
+    FROM ci_ranked cr
+    WHERE cr.grp_size >= 2 AND cr.id <> cr.keeper_id
+  ),
+  keeper_rows AS (
+    SELECT fr.keeper_id AS id
+    FROM full_ranked fr
+    WHERE fr.grp_size >= 2
+    UNION
+    SELECT cr.keeper_id AS id
+    FROM ci_ranked cr
+    WHERE cr.grp_size >= 2
+  ),
+  dup_targets AS (
+    SELECT DISTINCT ON (dr.id)
+      dr.id,
+      dr.keeper_id
+    FROM duplicate_rows dr
+    ORDER BY dr.id, dr.keeper_id
+  ),
+  mark_duplicates AS (
+    UPDATE public.cost_invoices ci
+    SET
+      is_duplicate = true,
+      duplicate_of = dt.keeper_id
+    FROM dup_targets dt
+    WHERE ci.id = dt.id
+    RETURNING ci.id
+  )
+  UPDATE public.cost_invoices ci
+  SET has_duplicate_siblings = true
+  WHERE ci.id IN (SELECT kr.id FROM keeper_rows kr);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."refresh_cost_invoice_duplicate_flags"("p_full_keys" "text"[], "p_ci_keys" "text"[]) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."resolve_company_from_costs_table"("p_domain" "text", "p_format_key" "text", "p_pdf_name" "text" DEFAULT NULL::"text") RETURNS "text"
@@ -1367,6 +2896,21 @@ $$;
 ALTER FUNCTION "public"."set_updated_by"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."split_line_matches_description_filter"("p_split_description" "text", "p_f_description" "text") RETURNS boolean
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM unnest(public.parse_description_filter_terms(p_f_description)) AS term
+    WHERE lower(coalesce(p_split_description, '')) LIKE '%' || lower(term) || '%'
+  );
+$$;
+
+
+ALTER FUNCTION "public"."split_line_matches_description_filter"("p_split_description" "text", "p_f_description" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."submission_owner"("_kind" "public"."submission_kind", "_id" "uuid") RETURNS "uuid"
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -1603,10 +3147,6 @@ $$;
 
 ALTER FUNCTION "public"."user_subcontractor"("_user_id" "uuid") OWNER TO "postgres";
 
-SET default_tablespace = '';
-
-SET default_table_access_method = "heap";
-
 
 CREATE TABLE IF NOT EXISTS "public"."app_settings" (
     "key" "text" NOT NULL,
@@ -1707,66 +3247,29 @@ CREATE TABLE IF NOT EXISTS "public"."cost_invoice_splits" (
     "cis_amount" numeric(12,2),
     "total_amount" numeric(12,2),
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "quantity" numeric
 );
 
 
 ALTER TABLE "public"."cost_invoice_splits" OWNER TO "postgres";
 
 
-CREATE TABLE IF NOT EXISTS "public"."cost_invoices" (
+CREATE TABLE IF NOT EXISTS "public"."cost_payment_remittances" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "status" "public"."cost_invoice_status" DEFAULT 'pending_review'::"public"."cost_invoice_status" NOT NULL,
-    "company_name" "text",
-    "company_name_raw" "text",
-    "invoice_number" "text",
-    "po_reference" "text",
-    "invoice_date" "date",
-    "due_date" "date",
-    "due_date_rule" "text",
-    "description" "text",
-    "currency" "text" DEFAULT 'GBP'::"text" NOT NULL,
-    "net_amount" numeric(12,2),
-    "vat_amount" numeric(12,2),
-    "total_amount" numeric(12,2),
-    "vat_treatment" "public"."cost_vat_treatment" DEFAULT 'unknown'::"public"."cost_vat_treatment" NOT NULL,
-    "nas_path" "text",
-    "attachment_filename" "text",
-    "attachment_sha256" "text",
-    "source_email_from" "text",
-    "source_subject" "text",
-    "source_message_id" "text",
-    "source_received_at" timestamp with time zone,
-    "gemini_confidence" numeric(4,3),
-    "is_duplicate" boolean DEFAULT false NOT NULL,
-    "duplicate_of" "uuid",
-    "notes" "text",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "paid_at" timestamp with time zone,
-    "cis_amount" numeric(12,2),
-    "document_type" "text" DEFAULT 'invoice'::"text" NOT NULL,
-    "nas_fallback_path" "text",
-    "project_id" "uuid",
-    "project_other" "text",
-    "is_overhead" boolean DEFAULT false NOT NULL,
-    "subcontractor_id" "uuid",
-    "timesheet_check_status" "text" DEFAULT 'unchecked'::"text" NOT NULL,
-    "timesheet_check_at" timestamp with time zone,
-    "timesheet_check_detail" "text",
-    "company_invoice_key" "text" GENERATED ALWAYS AS (NULLIF("lower"("regexp_replace"("btrim"(COALESCE("company_name", ''::"text")), '\s+'::"text", ' '::"text", 'g'::"text")), ''::"text")) STORED,
-    "invoice_number_key" "text" GENERATED ALWAYS AS (NULLIF("upper"("regexp_replace"("btrim"(COALESCE("invoice_number", ''::"text")), '\s+'::"text", ''::"text", 'g'::"text")), ''::"text")) STORED,
-    "supplier_email_domain" "text",
-    "invoice_format_key" "text",
-    "supplier_id" "uuid",
-    "supplier_vat_number" "text",
-    "supplier_company_reg_number" "text",
-    "payment_reminded_at" timestamp with time zone,
-    CONSTRAINT "cost_invoices_document_type_check" CHECK (("document_type" = ANY (ARRAY['invoice'::"text", 'credit_note'::"text"])))
+    "company_name" "text" NOT NULL,
+    "paid_at" timestamp with time zone NOT NULL,
+    "nas_path" "text" NOT NULL,
+    "total_net" numeric(12,2),
+    "total_vat" numeric(12,2),
+    "total_amount" numeric(12,2) DEFAULT 0 NOT NULL,
+    "invoice_count" integer DEFAULT 0 NOT NULL,
+    "lines" "jsonb" DEFAULT '[]'::"jsonb" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
 );
 
 
-ALTER TABLE "public"."cost_invoices" OWNER TO "postgres";
+ALTER TABLE "public"."cost_payment_remittances" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."cost_scan_skips" (
@@ -2120,31 +3623,6 @@ CREATE TABLE IF NOT EXISTS "public"."invoice_lines" (
 ALTER TABLE "public"."invoice_lines" OWNER TO "postgres";
 
 
-CREATE TABLE IF NOT EXISTS "public"."invoices" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "invoice_number" integer NOT NULL,
-    "invoice_date" "date" DEFAULT CURRENT_DATE NOT NULL,
-    "due_date" "date" NOT NULL,
-    "client_id" "uuid",
-    "client_name_snapshot" "text" DEFAULT ''::"text" NOT NULL,
-    "client_address_snapshot" "text" DEFAULT ''::"text" NOT NULL,
-    "client_reference" "text",
-    "purchase_order" "text",
-    "site_name" "text",
-    "description" "text",
-    "amount_net" numeric(12,2) DEFAULT 0 NOT NULL,
-    "vat_mode" "public"."invoice_vat_mode" DEFAULT 'reverse_charge'::"public"."invoice_vat_mode" NOT NULL,
-    "nas_path" "text",
-    "nas_pushed_at" timestamp with time zone,
-    "created_by" "uuid",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."invoices" OWNER TO "postgres";
-
-
 CREATE TABLE IF NOT EXISTS "public"."nas_sync_queue" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "kind" "text" NOT NULL,
@@ -2177,7 +3655,15 @@ CREATE TABLE IF NOT EXISTS "public"."notification_preferences" (
     "holiday_decision" boolean DEFAULT true NOT NULL,
     "todo_updates" boolean DEFAULT true NOT NULL,
     "timesheet_decision_roles" "jsonb" DEFAULT '{"admin": true, "worker": true, "manager": true, "cjb_manager": true, "super_admin": true}'::"jsonb" NOT NULL,
-    "holiday_decision_roles" "jsonb" DEFAULT '{"admin": true, "worker": true, "manager": true, "cjb_manager": true, "super_admin": true}'::"jsonb" NOT NULL
+    "holiday_decision_roles" "jsonb" DEFAULT '{"admin": true, "worker": true, "manager": true, "cjb_manager": true, "super_admin": true}'::"jsonb" NOT NULL,
+    "defect_review" boolean DEFAULT true NOT NULL,
+    "defect_closed" boolean DEFAULT true NOT NULL,
+    "defect_review_roles" "jsonb" DEFAULT '{"admin": true, "worker": true, "manager": true, "cjb_manager": true, "super_admin": true}'::"jsonb" NOT NULL,
+    "job_assigned" boolean DEFAULT true NOT NULL,
+    "vehicle_defect_submit_reminder" boolean DEFAULT true NOT NULL,
+    "timesheet_submit_reminder" boolean DEFAULT true NOT NULL,
+    "havs_submit_reminder" boolean DEFAULT true NOT NULL,
+    "vehicle_service_due" boolean DEFAULT true NOT NULL
 );
 
 
@@ -2465,7 +3951,9 @@ CREATE TABLE IF NOT EXISTS "public"."todo_lists" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "archived_at" timestamp with time zone,
     "pdf_revision" integer DEFAULT 1 NOT NULL,
-    "updated_by" "uuid"
+    "updated_by" "uuid",
+    "pdf_nas_path" "text",
+    "pdf_content_hash" "text"
 );
 
 ALTER TABLE ONLY "public"."todo_lists" REPLICA IDENTITY FULL;
@@ -2536,6 +4024,18 @@ CREATE TABLE IF NOT EXISTS "public"."user_roles" (
 ALTER TABLE "public"."user_roles" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."vehicle_assignments" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "vehicle_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "assigned_by" "uuid",
+    "assigned_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."vehicle_assignments" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."vehicle_defect_items" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "defect_id" "uuid" NOT NULL,
@@ -2577,7 +4077,14 @@ CREATE TABLE IF NOT EXISTS "public"."vehicles" (
     "registration" "text" NOT NULL,
     "description" "text",
     "active" boolean DEFAULT true NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "service_due_date" "date",
+    "service_due_mileage" integer,
+    "current_mileage" integer,
+    "mot_due_date" "date",
+    "tax_due_date" "date",
+    "mot_reminded_at" timestamp with time zone,
+    "tax_reminded_at" timestamp with time zone
 );
 
 
@@ -2645,6 +4152,11 @@ ALTER TABLE ONLY "public"."cost_invoice_splits"
 
 ALTER TABLE ONLY "public"."cost_invoices"
     ADD CONSTRAINT "cost_invoices_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."cost_payment_remittances"
+    ADD CONSTRAINT "cost_payment_remittances_pkey" PRIMARY KEY ("id");
 
 
 
@@ -2948,6 +4460,16 @@ ALTER TABLE ONLY "public"."user_roles"
 
 
 
+ALTER TABLE ONLY "public"."vehicle_assignments"
+    ADD CONSTRAINT "vehicle_assignments_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."vehicle_assignments"
+    ADD CONSTRAINT "vehicle_assignments_vehicle_id_key" UNIQUE ("vehicle_id");
+
+
+
 ALTER TABLE ONLY "public"."vehicle_defect_items"
     ADD CONSTRAINT "vehicle_defect_items_pkey" PRIMARY KEY ("id");
 
@@ -2976,6 +4498,14 @@ CREATE INDEX "cost_invoices_document_type_idx" ON "public"."cost_invoices" USING
 
 
 
+CREATE INDEX "cost_invoices_duplicate_flags_idx" ON "public"."cost_invoices" USING "btree" ("id") WHERE ("is_duplicate" OR "has_duplicate_siblings");
+
+
+
+CREATE INDEX "cost_invoices_full_field_dedupe_key_idx" ON "public"."cost_invoices" USING "btree" ("full_field_dedupe_key") WHERE ("full_field_dedupe_key" IS NOT NULL);
+
+
+
 CREATE INDEX "cost_invoices_invoice_date_idx" ON "public"."cost_invoices" USING "btree" ("invoice_date" DESC);
 
 
@@ -2988,7 +4518,15 @@ CREATE INDEX "cost_invoices_paid_idx" ON "public"."cost_invoices" USING "btree" 
 
 
 
+CREATE INDEX "cost_invoices_search_document_idx" ON "public"."cost_invoices" USING "gin" ("search_document");
+
+
+
 CREATE UNIQUE INDEX "cost_invoices_sha_unique" ON "public"."cost_invoices" USING "btree" ("attachment_sha256") WHERE ("attachment_sha256" IS NOT NULL);
+
+
+
+CREATE INDEX "cost_invoices_source_received_at_idx" ON "public"."cost_invoices" USING "btree" ("source_received_at" DESC);
 
 
 
@@ -2997,6 +4535,14 @@ CREATE INDEX "cost_invoices_status_idx" ON "public"."cost_invoices" USING "btree
 
 
 CREATE UNIQUE INDEX "cost_invoices_unique_company_invoice_number" ON "public"."cost_invoices" USING "btree" ("company_invoice_key", "invoice_number_key") WHERE (("company_invoice_key" IS NOT NULL) AND ("invoice_number_key" IS NOT NULL) AND ("invoice_number_key" <> ALL (ARRAY['NA'::"text", 'N/A'::"text", 'NO-NUMBER'::"text", 'NONUMBER'::"text", 'NO_NUMBER'::"text"])));
+
+
+
+CREATE INDEX "cost_payment_remittances_company_name_idx" ON "public"."cost_payment_remittances" USING "btree" ("company_name");
+
+
+
+CREATE INDEX "cost_payment_remittances_paid_at_idx" ON "public"."cost_payment_remittances" USING "btree" ("paid_at" DESC);
 
 
 
@@ -3076,6 +4622,14 @@ CREATE INDEX "invoices_invoice_date_idx" ON "public"."invoices" USING "btree" ("
 
 
 
+CREATE INDEX "invoices_invoice_number_idx" ON "public"."invoices" USING "btree" ("invoice_number" DESC);
+
+
+
+CREATE INDEX "invoices_search_document_idx" ON "public"."invoices" USING "gin" ("search_document");
+
+
+
 CREATE INDEX "nas_sync_queue_status_idx" ON "public"."nas_sync_queue" USING "btree" ("status", "created_at");
 
 
@@ -3152,6 +4706,14 @@ CREATE INDEX "user_notifications_user_unread_idx" ON "public"."user_notification
 
 
 
+CREATE INDEX "vehicle_assignments_user_idx" ON "public"."vehicle_assignments" USING "btree" ("user_id");
+
+
+
+CREATE INDEX "vehicle_assignments_vehicle_idx" ON "public"."vehicle_assignments" USING "btree" ("vehicle_id");
+
+
+
 CREATE INDEX "vehicle_defects_worker_id_inspection_date_idx" ON "public"."vehicle_defects" USING "btree" ("worker_id", "inspection_date" DESC);
 
 
@@ -3184,7 +4746,19 @@ CREATE OR REPLACE TRIGGER "bump_revision_trg" BEFORE UPDATE ON "public"."vehicle
 
 
 
+CREATE OR REPLACE TRIGGER "cost_invoices_after_write_refresh_duplicate_flags" AFTER INSERT OR DELETE OR UPDATE OF "company_name", "invoice_number", "po_reference", "invoice_date", "due_date", "description", "net_amount", "vat_amount", "total_amount", "vat_treatment", "currency" ON "public"."cost_invoices" FOR EACH ROW EXECUTE FUNCTION "public"."cost_invoices_after_write_refresh_duplicate_flags"();
+
+
+
 CREATE OR REPLACE TRIGGER "cost_invoices_canonical_company" BEFORE INSERT OR UPDATE OF "company_name", "source_email_from", "invoice_number", "supplier_vat_number", "supplier_company_reg_number" ON "public"."cost_invoices" FOR EACH ROW EXECUTE FUNCTION "public"."cost_invoices_apply_canonical_company"();
+
+
+
+CREATE OR REPLACE TRIGGER "cost_invoices_search_document" BEFORE INSERT OR UPDATE OF "company_name", "invoice_number", "po_reference", "description", "source_subject" ON "public"."cost_invoices" FOR EACH ROW EXECUTE FUNCTION "public"."cost_invoices_search_document_trigger"();
+
+
+
+CREATE OR REPLACE TRIGGER "cost_invoices_set_full_field_dedupe_key" BEFORE INSERT OR UPDATE OF "company_name", "invoice_number", "po_reference", "invoice_date", "due_date", "description", "net_amount", "vat_amount", "total_amount", "vat_treatment", "currency" ON "public"."cost_invoices" FOR EACH ROW EXECUTE FUNCTION "public"."cost_invoices_set_full_field_dedupe_key_trigger"();
 
 
 
@@ -3237,6 +4811,10 @@ CREATE OR REPLACE TRIGGER "holidays_before_update_status_guard" BEFORE UPDATE OF
 
 
 CREATE OR REPLACE TRIGGER "holidays_set_updated_at" BEFORE UPDATE ON "public"."holidays" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "invoices_search_document" BEFORE INSERT OR UPDATE OF "invoice_number", "client_name_snapshot", "client_reference", "purchase_order", "site_name", "description" ON "public"."invoices" FOR EACH ROW EXECUTE FUNCTION "public"."invoices_search_document_trigger"();
 
 
 
@@ -3703,6 +5281,21 @@ ALTER TABLE ONLY "public"."user_roles"
 
 
 
+ALTER TABLE ONLY "public"."vehicle_assignments"
+    ADD CONSTRAINT "vehicle_assignments_assigned_by_fkey" FOREIGN KEY ("assigned_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."vehicle_assignments"
+    ADD CONSTRAINT "vehicle_assignments_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."vehicle_assignments"
+    ADD CONSTRAINT "vehicle_assignments_vehicle_id_fkey" FOREIGN KEY ("vehicle_id") REFERENCES "public"."vehicles"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."vehicle_defect_items"
     ADD CONSTRAINT "vehicle_defect_items_defect_id_fkey" FOREIGN KEY ("defect_id") REFERENCES "public"."vehicle_defects"("id") ON DELETE CASCADE;
 
@@ -3748,6 +5341,10 @@ CREATE POLICY "Admins delete cost invoices" ON "public"."cost_invoices" FOR DELE
 
 
 
+CREATE POLICY "Admins delete cost payment remittances" ON "public"."cost_payment_remittances" FOR DELETE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
 CREATE POLICY "Admins insert app settings" ON "public"."app_settings" FOR INSERT TO "authenticated" WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
@@ -3773,6 +5370,10 @@ CREATE POLICY "Admins manage cost_suppliers" ON "public"."cost_suppliers" TO "au
 
 
 CREATE POLICY "Admins read cost invoices" ON "public"."cost_invoices" FOR SELECT TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+
+
+
+CREATE POLICY "Admins read cost payment remittances" ON "public"."cost_payment_remittances" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
 
@@ -3893,6 +5494,9 @@ CREATE POLICY "cost_invoice_splits admin all" ON "public"."cost_invoice_splits" 
 
 
 ALTER TABLE "public"."cost_invoices" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."cost_payment_remittances" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."cost_scan_skips" ENABLE ROW LEVEL SECURITY;
@@ -4503,6 +6107,17 @@ CREATE POLICY "vd_items read" ON "public"."vehicle_defect_items" FOR SELECT TO "
 
 
 
+CREATE POLICY "vehicle assignments admin write" ON "public"."vehicle_assignments" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "vehicle assignments read" ON "public"."vehicle_assignments" FOR SELECT TO "authenticated" USING ((("user_id" = "auth"."uid"()) OR "public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")));
+
+
+
+ALTER TABLE "public"."vehicle_assignments" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."vehicle_defect_items" ENABLE ROW LEVEL SECURITY;
 
 
@@ -4830,6 +6445,20 @@ GRANT ALL ON FUNCTION "public"."admin_set_vault_secret"("p_name" "text", "p_valu
 
 
 
+REVOKE ALL ON FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_payment_month" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_payment_month" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_payment_month" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_payment_month" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."bump_revision"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."bump_revision"() TO "service_role";
 
@@ -4876,13 +6505,105 @@ GRANT ALL ON FUNCTION "public"."continue_cost_scan"("p_url" "text", "p_apikey" "
 
 
 
+GRANT ALL ON TABLE "public"."cost_invoices" TO "anon";
+GRANT ALL ON TABLE "public"."cost_invoices" TO "authenticated";
+GRANT ALL ON TABLE "public"."cost_invoices" TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."cost_invoice_build_search_document"("p_row" "public"."cost_invoices") TO "anon";
+GRANT ALL ON FUNCTION "public"."cost_invoice_build_search_document"("p_row" "public"."cost_invoices") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cost_invoice_build_search_document"("p_row" "public"."cost_invoices") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."cost_invoice_ci_dedupe_key"("p_company_invoice_key" "text", "p_invoice_number_key" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."cost_invoice_ci_dedupe_key"("p_company_invoice_key" "text", "p_invoice_number_key" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cost_invoice_ci_dedupe_key"("p_company_invoice_key" "text", "p_invoice_number_key" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."cost_invoice_full_field_dedupe_key"("p_company_name" "text", "p_invoice_number" "text", "p_po_reference" "text", "p_invoice_date" "date", "p_due_date" "date", "p_description" "text", "p_net_amount" numeric, "p_vat_amount" numeric, "p_total_amount" numeric, "p_vat_treatment" "text", "p_currency" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."cost_invoice_full_field_dedupe_key"("p_company_name" "text", "p_invoice_number" "text", "p_po_reference" "text", "p_invoice_date" "date", "p_due_date" "date", "p_description" "text", "p_net_amount" numeric, "p_vat_amount" numeric, "p_total_amount" numeric, "p_vat_treatment" "text", "p_currency" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cost_invoice_full_field_dedupe_key"("p_company_name" "text", "p_invoice_number" "text", "p_po_reference" "text", "p_invoice_date" "date", "p_due_date" "date", "p_description" "text", "p_net_amount" numeric, "p_vat_amount" numeric, "p_total_amount" numeric, "p_vat_treatment" "text", "p_currency" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."cost_invoice_invoice_project_label"("p_project_id" "uuid", "p_project_other" "text", "p_is_overhead" boolean, "p_project_code" "text", "p_project_description" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."cost_invoice_invoice_project_label"("p_project_id" "uuid", "p_project_other" "text", "p_is_overhead" boolean, "p_project_code" "text", "p_project_description" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cost_invoice_invoice_project_label"("p_project_id" "uuid", "p_project_other" "text", "p_is_overhead" boolean, "p_project_code" "text", "p_project_description" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."cost_invoice_matches_project"("p_invoice" "public"."cost_invoices", "p_split_project_id" "uuid", "p_split_project_other" "text", "p_split_is_overhead" boolean, "p_f_project" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."cost_invoice_matches_project"("p_invoice" "public"."cost_invoices", "p_split_project_id" "uuid", "p_split_project_other" "text", "p_split_is_overhead" boolean, "p_f_project" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cost_invoice_matches_project"("p_invoice" "public"."cost_invoices", "p_split_project_id" "uuid", "p_split_project_other" "text", "p_split_is_overhead" boolean, "p_f_project" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."cost_invoice_norm_amount"("p_value" numeric) TO "anon";
+GRANT ALL ON FUNCTION "public"."cost_invoice_norm_amount"("p_value" numeric) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cost_invoice_norm_amount"("p_value" numeric) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."cost_invoice_norm_text"("p_value" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."cost_invoice_norm_text"("p_value" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cost_invoice_norm_text"("p_value" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public"."cost_invoices", "p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean) TO "anon";
+GRANT ALL ON FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public"."cost_invoices", "p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public"."cost_invoices", "p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."cost_invoice_sort_value"("p_row" "public"."cost_invoices", "p_sort_key" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."cost_invoice_sort_value"("p_row" "public"."cost_invoices", "p_sort_key" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cost_invoice_sort_value"("p_row" "public"."cost_invoices", "p_sort_key" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."cost_invoices_after_write_refresh_duplicate_flags"() TO "anon";
+GRANT ALL ON FUNCTION "public"."cost_invoices_after_write_refresh_duplicate_flags"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cost_invoices_after_write_refresh_duplicate_flags"() TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."cost_invoices_apply_canonical_company"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."cost_invoices_apply_canonical_company"() TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."cost_invoices_search_document_trigger"() TO "anon";
+GRANT ALL ON FUNCTION "public"."cost_invoices_search_document_trigger"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cost_invoices_search_document_trigger"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."cost_invoices_set_full_field_dedupe_key_trigger"() TO "anon";
+GRANT ALL ON FUNCTION "public"."cost_invoices_set_full_field_dedupe_key_trigger"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cost_invoices_set_full_field_dedupe_key_trigger"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."count_pending_timesheet_reviews"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."count_pending_timesheet_reviews"() TO "anon";
+GRANT ALL ON FUNCTION "public"."count_pending_timesheet_reviews"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."count_pending_timesheet_reviews"() TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."daily_briefing_autoapprove"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."daily_briefing_autoapprove"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."delete_cost_payment_remittances_for_invoices"("p_invoice_ids" "uuid"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."delete_cost_payment_remittances_for_invoices"("p_invoice_ids" "uuid"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_cost_payment_remittances_for_invoices"("p_invoice_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_cost_payment_remittances_for_invoices"("p_invoice_ids" "uuid"[]) TO "service_role";
 
 
 
@@ -4950,6 +6671,18 @@ GRANT ALL ON FUNCTION "public"."holidays_prevent_overlap"() TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."invoices" TO "anon";
+GRANT ALL ON TABLE "public"."invoices" TO "authenticated";
+GRANT ALL ON TABLE "public"."invoices" TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."invoice_build_search_document"("p_row" "public"."invoices") TO "anon";
+GRANT ALL ON FUNCTION "public"."invoice_build_search_document"("p_row" "public"."invoices") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."invoice_build_search_document"("p_row" "public"."invoices") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."invoice_format_key"("p_invoice_number" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."invoice_format_key"("p_invoice_number" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."invoice_format_key"("p_invoice_number" "text") TO "service_role";
@@ -4958,6 +6691,12 @@ GRANT ALL ON FUNCTION "public"."invoice_format_key"("p_invoice_number" "text") T
 
 REVOKE ALL ON FUNCTION "public"."invoices_before_insert"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."invoices_before_insert"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."invoices_search_document_trigger"() TO "anon";
+GRANT ALL ON FUNCTION "public"."invoices_search_document_trigger"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."invoices_search_document_trigger"() TO "service_role";
 
 
 
@@ -5003,9 +6742,57 @@ GRANT ALL ON FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") TO "se
 
 
 
+GRANT ALL ON FUNCTION "public"."list_cost_duplicate_id_sets"() TO "anon";
+GRANT ALL ON FUNCTION "public"."list_cost_duplicate_id_sets"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_cost_duplicate_id_sets"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_f_company_exact" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_f_company_exact" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_f_company_exact" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_f_company_exact" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."list_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer, "p_unpaginated" boolean, "p_cursor_sort_value" "text", "p_cursor_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."list_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer, "p_unpaginated" boolean, "p_cursor_sort_value" "text", "p_cursor_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."list_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer, "p_unpaginated" boolean, "p_cursor_sort_value" "text", "p_cursor_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer, "p_unpaginated" boolean, "p_cursor_sort_value" "text", "p_cursor_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."list_cost_payment_remittances"("p_company" "text", "p_paid_from" "date", "p_paid_to" "date", "p_limit" integer, "p_offset" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."list_cost_payment_remittances"("p_company" "text", "p_paid_from" "date", "p_paid_to" "date", "p_limit" integer, "p_offset" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."list_cost_payment_remittances"("p_company" "text", "p_paid_from" "date", "p_paid_to" "date", "p_limit" integer, "p_offset" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_cost_payment_remittances"("p_company" "text", "p_paid_from" "date", "p_paid_to" "date", "p_limit" integer, "p_offset" integer) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[]) TO "service_role";
 
 
 
@@ -5032,9 +6819,22 @@ GRANT ALL ON FUNCTION "public"."normalize_vat_number"("p_vat" "text") TO "servic
 
 
 
+REVOKE ALL ON FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."owns_submission"("_kind" "public"."submission_kind", "_submission_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."owns_submission"("_kind" "public"."submission_kind", "_submission_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."owns_submission"("_kind" "public"."submission_kind", "_submission_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."parse_description_filter_terms"("p_f_description" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."parse_description_filter_terms"("p_f_description" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."parse_description_filter_terms"("p_f_description" "text") TO "service_role";
 
 
 
@@ -5046,6 +6846,13 @@ GRANT ALL ON FUNCTION "public"."pick_domain_canonical"("p_domain" "text") TO "se
 
 REVOKE ALL ON FUNCTION "public"."profiles_guard_sensitive_self_update"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."profiles_guard_sensitive_self_update"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."refresh_cost_invoice_duplicate_flags"("p_full_keys" "text"[], "p_ci_keys" "text"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."refresh_cost_invoice_duplicate_flags"("p_full_keys" "text"[], "p_ci_keys" "text"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."refresh_cost_invoice_duplicate_flags"("p_full_keys" "text"[], "p_ci_keys" "text"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."refresh_cost_invoice_duplicate_flags"("p_full_keys" "text"[], "p_ci_keys" "text"[]) TO "service_role";
 
 
 
@@ -5107,6 +6914,12 @@ GRANT ALL ON FUNCTION "public"."set_updated_at_havs_tools"() TO "service_role";
 
 REVOKE ALL ON FUNCTION "public"."set_updated_by"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."set_updated_by"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."split_line_matches_description_filter"("p_split_description" "text", "p_f_description" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."split_line_matches_description_filter"("p_split_description" "text", "p_f_description" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."split_line_matches_description_filter"("p_split_description" "text", "p_f_description" "text") TO "service_role";
 
 
 
@@ -5236,9 +7049,9 @@ GRANT ALL ON TABLE "public"."cost_invoice_splits" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."cost_invoices" TO "anon";
-GRANT ALL ON TABLE "public"."cost_invoices" TO "authenticated";
-GRANT ALL ON TABLE "public"."cost_invoices" TO "service_role";
+GRANT ALL ON TABLE "public"."cost_payment_remittances" TO "anon";
+GRANT ALL ON TABLE "public"."cost_payment_remittances" TO "authenticated";
+GRANT ALL ON TABLE "public"."cost_payment_remittances" TO "service_role";
 
 
 
@@ -5362,12 +7175,6 @@ GRANT ALL ON TABLE "public"."invoice_lines" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."invoices" TO "anon";
-GRANT ALL ON TABLE "public"."invoices" TO "authenticated";
-GRANT ALL ON TABLE "public"."invoices" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."nas_sync_queue" TO "anon";
 GRANT ALL ON TABLE "public"."nas_sync_queue" TO "authenticated";
 GRANT ALL ON TABLE "public"."nas_sync_queue" TO "service_role";
@@ -5452,6 +7259,10 @@ GRANT SELECT("last_active_at") ON TABLE "public"."profiles" TO "authenticated";
 
 GRANT SELECT("mfa_enabled") ON TABLE "public"."profiles" TO "anon";
 GRANT SELECT("mfa_enabled") ON TABLE "public"."profiles" TO "authenticated";
+
+
+
+GRANT SELECT("notification_prompt_seen") ON TABLE "public"."profiles" TO "authenticated";
 
 
 
@@ -5554,6 +7365,12 @@ GRANT ALL ON TABLE "public"."user_notifications" TO "service_role";
 GRANT ALL ON TABLE "public"."user_roles" TO "anon";
 GRANT ALL ON TABLE "public"."user_roles" TO "authenticated";
 GRANT ALL ON TABLE "public"."user_roles" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."vehicle_assignments" TO "anon";
+GRANT ALL ON TABLE "public"."vehicle_assignments" TO "authenticated";
+GRANT ALL ON TABLE "public"."vehicle_assignments" TO "service_role";
 
 
 
