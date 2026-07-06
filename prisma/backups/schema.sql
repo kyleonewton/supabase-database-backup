@@ -409,6 +409,43 @@ $$;
 ALTER FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."auto_assign_todo_list_creator"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF NEW.created_by IS NOT NULL THEN
+    INSERT INTO public.todo_list_assignments (list_id, user_id, assigned_by)
+    VALUES (NEW.id, NEW.created_by, NEW.created_by)
+    ON CONFLICT (list_id, user_id) DO NOTHING;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."auto_assign_todo_list_creator"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."backfill_todo_list_subcontractor_sync"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  INSERT INTO public.todo_list_assignments (list_id, user_id, assigned_by)
+  SELECT NEW.list_id, p.id, NEW.synced_by
+  FROM public.profiles p
+  WHERE p.subcontractor_id = NEW.subcontractor_id
+    AND COALESCE(p.active, true)
+  ON CONFLICT (list_id, user_id) DO NOTHING;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."backfill_todo_list_subcontractor_sync"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."bump_revision"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -469,8 +506,7 @@ CREATE OR REPLACE FUNCTION "public"."can_access_todo_list"("_user_id" "uuid", "_
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  SELECT public.has_role(_user_id, 'admin'::app_role)
-  OR public.has_role(_user_id, 'cjb_manager'::app_role)
+  SELECT public.has_role(_user_id, 'super_admin'::app_role)
   OR (
     EXISTS (
       SELECT 1 FROM public.todo_lists
@@ -482,6 +518,103 @@ $$;
 
 
 ALTER FUNCTION "public"."can_access_todo_list"("_user_id" "uuid", "_list_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."can_assign_todo_list"("_assigner_id" "uuid", "_list_id" "uuid", "_target_user_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    public.has_role(_assigner_id, 'super_admin'::app_role)
+    OR (
+      public.has_role(_assigner_id, 'admin'::app_role)
+      AND (
+        public.is_assigned_to_todo_list(_assigner_id, _list_id)
+        OR EXISTS (
+          SELECT 1 FROM public.todo_lists
+          WHERE id = _list_id AND created_by = _assigner_id
+        )
+      )
+    )
+    OR (
+      public.has_role(_assigner_id, 'cjb_manager'::app_role)
+      AND (
+        public.is_assigned_to_todo_list(_assigner_id, _list_id)
+        OR EXISTS (
+          SELECT 1 FROM public.todo_lists
+          WHERE id = _list_id AND created_by = _assigner_id
+        )
+      )
+    )
+    OR (
+      public.has_role(_assigner_id, 'manager'::app_role)
+      AND (
+        public.is_assigned_to_todo_list(_assigner_id, _list_id)
+        OR EXISTS (
+          SELECT 1 FROM public.todo_lists
+          WHERE id = _list_id AND created_by = _assigner_id
+        )
+      )
+      AND (
+        (
+          public.user_subcontractor(_assigner_id) IS NOT NULL
+          AND public.user_subcontractor(_assigner_id) = public.user_subcontractor(_target_user_id)
+        )
+        OR public.has_role(_target_user_id, 'manager'::app_role)
+      )
+    )
+$$;
+
+
+ALTER FUNCTION "public"."can_assign_todo_list"("_assigner_id" "uuid", "_list_id" "uuid", "_target_user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."can_delete_todo_list"("_user_id" "uuid", "_list_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    public.has_role(_user_id, 'super_admin'::app_role)
+    OR (
+      public.has_role(_user_id, 'admin'::app_role)
+      AND public.is_assigned_to_todo_list(_user_id, _list_id)
+    )
+    OR (
+      public.has_role(_user_id, 'manager'::app_role)
+      AND public.is_assigned_to_todo_list(_user_id, _list_id)
+      AND public.user_subcontractor(_user_id) IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM public.todo_list_assignments tla
+        WHERE tla.list_id = _list_id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM public.todo_list_assignments tla
+        JOIN public.profiles p ON p.id = tla.user_id
+        WHERE tla.list_id = _list_id
+          AND (
+            p.subcontractor_id IS NULL
+            OR p.subcontractor_id <> public.user_subcontractor(_user_id)
+          )
+      )
+    )
+$$;
+
+
+ALTER FUNCTION "public"."can_delete_todo_list"("_user_id" "uuid", "_list_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."can_manage_rams_briefing"("_briefer_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    public.can_manage_submission(_briefer_id)
+    OR public.has_role(auth.uid(), 'cjb_manager')
+$$;
+
+
+ALTER FUNCTION "public"."can_manage_rams_briefing"("_briefer_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."can_manage_submission"("_worker_id" "uuid") RETURNS boolean
@@ -510,18 +643,33 @@ CREATE OR REPLACE FUNCTION "public"."can_modify_todo_item"("_user_id" "uuid", "_
     SELECT 1
     FROM public.todo_items ti
     WHERE ti.id = _item_id
-      AND public.can_access_todo_list(_user_id, ti.list_id)
       AND (
-        public.has_role(_user_id, 'admin'::app_role)
+        public.has_role(_user_id, 'super_admin'::app_role)
         OR (
-          public.has_role(_user_id, 'worker'::app_role)
-          AND ti.created_by = _user_id
-        )
-        OR (
-          public.has_role(_user_id, 'manager'::app_role)
-          AND public.user_subcontractor(_user_id) IS NOT NULL
-          AND ti.created_by IS NOT NULL
-          AND public.user_subcontractor(_user_id) = public.user_subcontractor(ti.created_by)
+          public.can_access_todo_list(_user_id, ti.list_id)
+          AND (
+            public.has_role(_user_id, 'admin'::app_role)
+            OR (
+              public.has_role(_user_id, 'worker'::app_role)
+              AND ti.created_by = _user_id
+            )
+            OR (
+              public.has_role(_user_id, 'cjb_manager'::app_role)
+              AND ti.created_by = _user_id
+            )
+            OR (
+              public.has_role(_user_id, 'manager'::app_role)
+              AND (
+                ti.created_by = _user_id
+                OR (
+                  ti.created_by IS NOT NULL
+                  AND public.has_role(ti.created_by, 'worker'::app_role)
+                  AND public.user_subcontractor(_user_id) IS NOT NULL
+                  AND public.user_subcontractor(_user_id) = public.user_subcontractor(ti.created_by)
+                )
+              )
+            )
+          )
         )
       )
   )
@@ -2140,6 +2288,241 @@ $$;
 ALTER FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid" DEFAULT NULL::"uuid", "p_group" "text" DEFAULT NULL::"text", "p_client" "uuid" DEFAULT NULL::"uuid", "p_search" "text" DEFAULT NULL::"text", "p_allowed_worker_ids" "uuid"[] DEFAULT NULL::"uuid"[], "p_limit" integer DEFAULT 20, "p_offset" integer DEFAULT 0, "p_sensitive_owner_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("kind" "text", "id" "uuid", "worker_id" "uuid", "who" "text", "group_name" "text", "label" "text", "status" "text", "when_at" timestamp with time zone, "client_id" "uuid", "client_ids" "uuid"[], "repaired" boolean, "total_count" bigint)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  WITH base AS (
+    SELECT
+      'timesheet'::text AS kind,
+      t.id,
+      t.worker_id,
+      COALESCE(p.full_name, p.username, 'Unknown') AS who,
+      s.name AS group_name,
+      'Week ending ' || to_char(t.week_ending::date, 'DD Mon YYYY') AS label,
+      t.status::text AS status,
+      t.created_at AS when_at,
+      NULL::uuid AS client_id,
+      COALESCE((
+        SELECT array_agg(DISTINCT pr.client_id) FILTER (WHERE pr.client_id IS NOT NULL)
+        FROM public.timesheet_days td
+        JOIN public.projects pr ON pr.id = td.project_id
+        WHERE td.timesheet_id = t.id
+      ), ARRAY[]::uuid[]) AS client_ids,
+      false AS repaired
+    FROM public.timesheets t
+    LEFT JOIN public.profiles p ON p.id = t.worker_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE t.week_ending >= p_from
+      AND t.week_ending <= p_to
+      AND ('timesheet' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'plant_inspection',
+      pi.id,
+      pi.worker_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'Plant: ' || COALESCE(pi.plant_description, ''),
+      pi.status::text,
+      pi.created_at,
+      pi.client_id,
+      CASE WHEN pi.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[pi.client_id] END,
+      EXISTS (
+        SELECT 1 FROM public.plant_inspection_items pii
+        WHERE pii.inspection_id = pi.id AND pii.repaired_at IS NOT NULL
+      )
+    FROM public.plant_inspections pi
+    LEFT JOIN public.profiles p ON p.id = pi.worker_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE pi.inspection_date >= p_from
+      AND pi.inspection_date <= p_to
+      AND ('plant_inspection' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'vehicle_defect',
+      vd.id,
+      vd.worker_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'Vehicle: ' || COALESCE(vd.vehicle_registration, ''),
+      vd.status::text,
+      vd.created_at,
+      NULL::uuid,
+      ARRAY[]::uuid[],
+      EXISTS (
+        SELECT 1 FROM public.vehicle_defect_items vdi
+        WHERE vdi.defect_id = vd.id AND vdi.repaired_at IS NOT NULL
+      )
+    FROM public.vehicle_defects vd
+    LEFT JOIN public.profiles p ON p.id = vd.worker_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE vd.inspection_date >= p_from
+      AND vd.inspection_date <= p_to
+      AND ('vehicle_defect' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'rams_briefing',
+      rb.id,
+      rb.briefer_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'RAMS: ' || COALESCE(rb.method_statement_title, ''),
+      rb.status::text,
+      rb.created_at,
+      rb.client_id,
+      CASE WHEN rb.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[rb.client_id] END,
+      false
+    FROM public.rams_briefings rb
+    LEFT JOIN public.profiles p ON p.id = rb.briefer_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE rb.briefing_date >= p_from
+      AND rb.briefing_date <= p_to
+      AND ('rams_briefing' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'havs_log',
+      hl.id,
+      hl.worker_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'HAVS · ' || COALESCE(hl.total_points::text, '0') || ' pts',
+      hl.status::text,
+      hl.created_at,
+      hl.client_id,
+      CASE WHEN hl.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[hl.client_id] END,
+      false
+    FROM public.havs_logs hl
+    LEFT JOIN public.profiles p ON p.id = hl.worker_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE hl.log_date >= p_from
+      AND hl.log_date <= p_to
+      AND ('havs_log' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'toolbox_talk',
+      tt.id,
+      tt.briefer_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'Toolbox: ' || COALESCE(tt.topic, ''),
+      tt.status::text,
+      tt.created_at,
+      tt.client_id,
+      CASE WHEN tt.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[tt.client_id] END,
+      false
+    FROM public.toolbox_talks tt
+    LEFT JOIN public.profiles p ON p.id = tt.briefer_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE tt.talk_date >= p_from
+      AND tt.talk_date <= p_to
+      AND ('toolbox_talk' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'daily_briefing',
+      db.id,
+      db.briefer_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'Daily Briefing · ' || to_char(db.time_delivered, 'DD Mon YYYY HH24:MI'),
+      db.status::text,
+      db.created_at,
+      db.client_id,
+      CASE WHEN db.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[db.client_id] END,
+      false
+    FROM public.daily_briefings db
+    LEFT JOIN public.profiles p ON p.id = db.briefer_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE db.time_delivered >= (p_from::timestamptz)
+      AND db.time_delivered <= ((p_to::text || 'T23:59:59')::timestamptz)
+      AND ('daily_briefing' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'starter',
+      es.id,
+      es.user_id,
+      CASE
+        WHEN es.user_id IS NULL THEN '(deleted user)'
+        ELSE COALESCE(p.full_name, p.username, 'Unknown')
+      END,
+      s.name,
+      'Starter form · ' || COALESCE(es.full_name, '') || ' (v' || COALESCE(es.revision, 1)::text || ')',
+      CASE WHEN es.submitted_at IS NOT NULL THEN 'submitted' ELSE 'draft' END,
+      COALESCE(es.submitted_at, es.created_at),
+      NULL::uuid,
+      ARRAY[]::uuid[],
+      false
+    FROM public.employee_starters es
+    LEFT JOIN public.profiles p ON p.id = es.user_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE es.created_at >= p_from::timestamptz
+      AND es.created_at <= ((p_to::text || 'T23:59:59')::timestamptz)
+      AND ('starter' = ANY (p_kinds))
+  ),
+  filtered AS (
+    SELECT *
+    FROM base b
+    WHERE (p_worker_id IS NULL OR b.worker_id = p_worker_id)
+      AND (p_allowed_worker_ids IS NULL OR b.worker_id = ANY (p_allowed_worker_ids))
+      AND (
+        p_sensitive_owner_id IS NULL
+        OR b.kind NOT IN ('timesheet', 'starter')
+        OR b.worker_id = p_sensitive_owner_id
+      )
+      AND (COALESCE(NULLIF(trim(p_group), ''), NULL) IS NULL OR b.group_name = p_group)
+      AND (
+        p_client IS NULL
+        OR (b.kind = 'timesheet' AND p_client = ANY (b.client_ids))
+        OR (b.kind <> 'timesheet' AND b.client_id = p_client)
+      )
+      AND (
+        COALESCE(NULLIF(trim(p_search), ''), NULL) IS NULL
+        OR lower(b.label || ' ' || b.who || ' ' || COALESCE(b.group_name, '')) LIKE '%' || lower(trim(p_search)) || '%'
+      )
+  ),
+  ranked AS (
+    SELECT
+      f.*,
+      count(*) OVER () AS total_count
+    FROM filtered f
+    ORDER BY f.when_at DESC
+    LIMIT GREATEST(p_limit, 0)
+    OFFSET GREATEST(p_offset, 0)
+  )
+  SELECT
+    r.kind,
+    r.id,
+    r.worker_id,
+    r.who,
+    r.group_name,
+    r.label,
+    r.status,
+    r.when_at,
+    r.client_id,
+    r.client_ids,
+    r.repaired,
+    r.total_count
+  FROM ranked r;
+$$;
+
+
+ALTER FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") RETURNS TABLE("supplier_id" "uuid", "canonical_name" "text")
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -2896,6 +3279,36 @@ $$;
 ALTER FUNCTION "public"."set_updated_by"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."shares_synced_subcontractor_staff_profile"("_viewer_id" "uuid", "_profile_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    public.user_subcontractor(_viewer_id) IS NOT NULL
+    AND public.is_staff(_profile_id)
+    AND EXISTS (
+      SELECT 1
+      FROM public.profiles p
+      WHERE p.id = _profile_id
+        AND p.subcontractor_id = public.user_subcontractor(_viewer_id)
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM public.todo_list_subcontractor_syncs tls
+      JOIN public.todo_list_assignments viewer_a
+        ON viewer_a.list_id = tls.list_id
+       AND viewer_a.user_id = _viewer_id
+      JOIN public.todo_list_assignments staff_a
+        ON staff_a.list_id = tls.list_id
+       AND staff_a.user_id = _profile_id
+      WHERE tls.subcontractor_id = public.user_subcontractor(_viewer_id)
+    )
+$$;
+
+
+ALTER FUNCTION "public"."shares_synced_subcontractor_staff_profile"("_viewer_id" "uuid", "_profile_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."shares_todo_list_with"("_user_id" "uuid", "_other_user_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -2960,6 +3373,61 @@ $$;
 
 
 ALTER FUNCTION "public"."supplier_legal_name_key"("p_name" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."sync_todo_list_assignments_for_profile"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.subcontractor_id IS NOT NULL AND COALESCE(NEW.active, true) THEN
+      INSERT INTO public.todo_list_assignments (list_id, user_id, assigned_by)
+      SELECT tls.list_id, NEW.id, tls.synced_by
+      FROM public.todo_list_subcontractor_syncs tls
+      WHERE tls.subcontractor_id = NEW.subcontractor_id
+      ON CONFLICT (list_id, user_id) DO NOTHING;
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF TG_OP = 'UPDATE' THEN
+    IF COALESCE(NEW.active, true) = false AND COALESCE(OLD.active, true) = true THEN
+      DELETE FROM public.todo_list_assignments tla
+      USING public.todo_list_subcontractor_syncs tls
+      WHERE tla.list_id = tls.list_id
+        AND tla.user_id = NEW.id
+        AND tls.subcontractor_id = COALESCE(OLD.subcontractor_id, NEW.subcontractor_id);
+    END IF;
+
+    IF OLD.subcontractor_id IS NOT NULL
+       AND (NEW.subcontractor_id IS DISTINCT FROM OLD.subcontractor_id OR COALESCE(NEW.active, true) = false) THEN
+      DELETE FROM public.todo_list_assignments tla
+      USING public.todo_list_subcontractor_syncs tls
+      WHERE tla.list_id = tls.list_id
+        AND tla.user_id = NEW.id
+        AND tls.subcontractor_id = OLD.subcontractor_id;
+    END IF;
+
+    IF NEW.subcontractor_id IS NOT NULL
+       AND COALESCE(NEW.active, true)
+       AND NEW.subcontractor_id IS DISTINCT FROM OLD.subcontractor_id THEN
+      INSERT INTO public.todo_list_assignments (list_id, user_id, assigned_by)
+      SELECT tls.list_id, NEW.id, tls.synced_by
+      FROM public.todo_list_subcontractor_syncs tls
+      WHERE tls.subcontractor_id = NEW.subcontractor_id
+      ON CONFLICT (list_id, user_id) DO NOTHING;
+    END IF;
+
+    RETURN NEW;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."sync_todo_list_assignments_for_profile"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."timesheet_days_touch_parent"() RETURNS "trigger"
@@ -3825,7 +4293,11 @@ CREATE TABLE IF NOT EXISTS "public"."rams_attendees" (
     "position" smallint NOT NULL,
     "name" "text" NOT NULL,
     "signature_url" "text",
-    "user_id" "uuid"
+    "user_id" "uuid",
+    "briefed_by_name" "text" NOT NULL,
+    "briefing_date" "date" DEFAULT CURRENT_DATE NOT NULL,
+    "briefer_signature_url" "text",
+    "briefed_by_user_id" "uuid"
 );
 
 
@@ -3963,6 +4435,17 @@ ALTER TABLE ONLY "public"."todo_list_assignments" REPLICA IDENTITY FULL;
 ALTER TABLE "public"."todo_list_assignments" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."todo_list_subcontractor_syncs" (
+    "list_id" "uuid" NOT NULL,
+    "subcontractor_id" "uuid" NOT NULL,
+    "synced_by" "uuid",
+    "synced_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."todo_list_subcontractor_syncs" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."todo_lists" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "title" "text" NOT NULL,
@@ -3975,7 +4458,8 @@ CREATE TABLE IF NOT EXISTS "public"."todo_lists" (
     "pdf_nas_path" "text",
     "pdf_content_hash" "text",
     "remind_at" timestamp with time zone,
-    "reminder_sent_at" timestamp with time zone
+    "reminder_sent_at" timestamp with time zone,
+    "information_only" boolean DEFAULT false NOT NULL
 );
 
 ALTER TABLE ONLY "public"."todo_lists" REPLICA IDENTITY FULL;
@@ -4447,6 +4931,11 @@ ALTER TABLE ONLY "public"."todo_list_assignments"
 
 
 
+ALTER TABLE ONLY "public"."todo_list_subcontractor_syncs"
+    ADD CONSTRAINT "todo_list_subcontractor_syncs_pkey" PRIMARY KEY ("list_id", "subcontractor_id");
+
+
+
 ALTER TABLE ONLY "public"."todo_lists"
     ADD CONSTRAINT "todo_lists_pkey" PRIMARY KEY ("id");
 
@@ -4720,6 +5209,10 @@ CREATE INDEX "todo_list_assignments_user_idx" ON "public"."todo_list_assignments
 
 
 
+CREATE INDEX "todo_list_subcontractor_syncs_sub_idx" ON "public"."todo_list_subcontractor_syncs" USING "btree" ("subcontractor_id");
+
+
+
 CREATE INDEX "todo_lists_due_reminder_idx" ON "public"."todo_lists" USING "btree" ("remind_at") WHERE (("remind_at" IS NOT NULL) AND ("reminder_sent_at" IS NULL) AND ("archived_at" IS NULL));
 
 
@@ -4852,6 +5345,10 @@ CREATE OR REPLACE TRIGGER "profiles_guard_sensitive_self_update" BEFORE UPDATE O
 
 
 
+CREATE OR REPLACE TRIGGER "profiles_sync_todo_list_assignments" AFTER INSERT OR UPDATE OF "subcontractor_id", "active" ON "public"."profiles" FOR EACH ROW EXECUTE FUNCTION "public"."sync_todo_list_assignments_for_profile"();
+
+
+
 CREATE OR REPLACE TRIGGER "set_cost_company_aliases_updated_at" BEFORE UPDATE ON "public"."cost_company_aliases" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
 
 
@@ -4881,6 +5378,14 @@ CREATE OR REPLACE TRIGGER "todo_items_set_updated_at" BEFORE UPDATE ON "public".
 
 
 CREATE OR REPLACE TRIGGER "todo_items_set_updated_by" BEFORE UPDATE ON "public"."todo_items" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_by"();
+
+
+
+CREATE OR REPLACE TRIGGER "todo_list_subcontractor_syncs_backfill" AFTER INSERT ON "public"."todo_list_subcontractor_syncs" FOR EACH ROW EXECUTE FUNCTION "public"."backfill_todo_list_subcontractor_sync"();
+
+
+
+CREATE OR REPLACE TRIGGER "todo_lists_auto_assign_creator" AFTER INSERT ON "public"."todo_lists" FOR EACH ROW EXECUTE FUNCTION "public"."auto_assign_todo_list_creator"();
 
 
 
@@ -5167,6 +5672,11 @@ ALTER TABLE ONLY "public"."push_subscriptions"
 
 
 ALTER TABLE ONLY "public"."rams_attendees"
+    ADD CONSTRAINT "rams_attendees_briefed_by_user_id_fkey" FOREIGN KEY ("briefed_by_user_id") REFERENCES "public"."profiles"("id");
+
+
+
+ALTER TABLE ONLY "public"."rams_attendees"
     ADD CONSTRAINT "rams_attendees_briefing_id_fkey" FOREIGN KEY ("briefing_id") REFERENCES "public"."rams_briefings"("id") ON DELETE CASCADE;
 
 
@@ -5258,6 +5768,21 @@ ALTER TABLE ONLY "public"."todo_list_assignments"
 
 ALTER TABLE ONLY "public"."todo_list_assignments"
     ADD CONSTRAINT "todo_list_assignments_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."todo_list_subcontractor_syncs"
+    ADD CONSTRAINT "todo_list_subcontractor_syncs_list_id_fkey" FOREIGN KEY ("list_id") REFERENCES "public"."todo_lists"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."todo_list_subcontractor_syncs"
+    ADD CONSTRAINT "todo_list_subcontractor_syncs_subcontractor_id_fkey" FOREIGN KEY ("subcontractor_id") REFERENCES "public"."subcontractors"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."todo_list_subcontractor_syncs"
+    ADD CONSTRAINT "todo_list_subcontractor_syncs_synced_by_fkey" FOREIGN KEY ("synced_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
 
 
 
@@ -5794,7 +6319,7 @@ CREATE POLICY "profiles admin all" ON "public"."profiles" TO "authenticated" USI
 
 
 
-CREATE POLICY "profiles self read" ON "public"."profiles" FOR SELECT TO "authenticated" USING ((("id" = "auth"."uid"()) OR "public"."is_staff"("auth"."uid"()) OR "public"."shares_todo_list_with"("auth"."uid"(), "id")));
+CREATE POLICY "profiles self read" ON "public"."profiles" FOR SELECT TO "authenticated" USING ((("id" = "auth"."uid"()) OR "public"."is_staff"("auth"."uid"()) OR "public"."shares_todo_list_with"("auth"."uid"(), "id") OR "public"."shares_synced_subcontractor_staff_profile"("auth"."uid"(), "id")));
 
 
 
@@ -5847,7 +6372,11 @@ CREATE POLICY "rams delete admin or manager scope" ON "public"."rams_briefings" 
 
 
 
-CREATE POLICY "rams manage update" ON "public"."rams_briefings" FOR UPDATE TO "authenticated" USING ("public"."can_manage_submission"("briefer_id")) WITH CHECK ("public"."can_manage_submission"("briefer_id"));
+CREATE POLICY "rams manage delete" ON "public"."rams_briefings" FOR DELETE TO "authenticated" USING ("public"."can_manage_rams_briefing"("briefer_id"));
+
+
+
+CREATE POLICY "rams manage update" ON "public"."rams_briefings" FOR UPDATE TO "authenticated" USING ("public"."can_manage_rams_briefing"("briefer_id")) WITH CHECK ("public"."can_manage_rams_briefing"("briefer_id"));
 
 
 
@@ -5861,9 +6390,9 @@ CREATE POLICY "rams read scope" ON "public"."rams_briefings" FOR SELECT TO "auth
 
 CREATE POLICY "rams_att owner write" ON "public"."rams_attendees" TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."rams_briefings" "b"
-  WHERE (("b"."id" = "rams_attendees"."briefing_id") AND "public"."can_manage_submission"("b"."briefer_id"))))) WITH CHECK ((EXISTS ( SELECT 1
+  WHERE (("b"."id" = "rams_attendees"."briefing_id") AND "public"."can_manage_rams_briefing"("b"."briefer_id"))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."rams_briefings" "b"
-  WHERE (("b"."id" = "rams_attendees"."briefing_id") AND "public"."can_manage_submission"("b"."briefer_id")))));
+  WHERE (("b"."id" = "rams_attendees"."briefing_id") AND "public"."can_manage_rams_briefing"("b"."briefer_id")))));
 
 
 
@@ -5999,19 +6528,15 @@ CREATE POLICY "timesheets update owner unapproved or staff" ON "public"."timeshe
 
 
 
-CREATE POLICY "todo assignments admin write" ON "public"."todo_list_assignments" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "todo assignments delete" ON "public"."todo_list_assignments" FOR DELETE TO "authenticated" USING ("public"."can_assign_todo_list"("auth"."uid"(), "list_id", "user_id"));
 
 
 
-CREATE POLICY "todo assignments manager delete" ON "public"."todo_list_assignments" FOR DELETE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id"))));
+CREATE POLICY "todo assignments insert" ON "public"."todo_list_assignments" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_assign_todo_list"("auth"."uid"(), "list_id", "user_id"));
 
 
 
-CREATE POLICY "todo assignments manager insert" ON "public"."todo_list_assignments" FOR INSERT TO "authenticated" WITH CHECK (("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id"))));
-
-
-
-CREATE POLICY "todo assignments read" ON "public"."todo_list_assignments" FOR SELECT TO "authenticated" USING ((("user_id" = "auth"."uid"()) OR "public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id"))));
+CREATE POLICY "todo assignments read" ON "public"."todo_list_assignments" FOR SELECT TO "authenticated" USING (("public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
 
 
 
@@ -6043,19 +6568,31 @@ CREATE POLICY "todo items update" ON "public"."todo_items" FOR UPDATE TO "authen
 
 
 
-CREATE POLICY "todo lists admin delete" ON "public"."todo_lists" FOR DELETE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "todo list sync delete" ON "public"."todo_list_subcontractor_syncs" FOR DELETE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role") OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id") AND ("public"."user_subcontractor"("auth"."uid"()) = "subcontractor_id")) OR ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id"))));
 
 
 
-CREATE POLICY "todo lists admin update" ON "public"."todo_lists" FOR UPDATE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "todo list sync insert" ON "public"."todo_list_subcontractor_syncs" FOR INSERT TO "authenticated" WITH CHECK (("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role") OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id") AND ("public"."user_subcontractor"("auth"."uid"()) = "subcontractor_id")) OR ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id"))));
 
 
 
-CREATE POLICY "todo lists insert" ON "public"."todo_lists" FOR INSERT TO "authenticated" WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role")));
+CREATE POLICY "todo list sync read" ON "public"."todo_list_subcontractor_syncs" FOR SELECT TO "authenticated" USING (("public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+
+
+
+CREATE POLICY "todo lists delete" ON "public"."todo_lists" FOR DELETE TO "authenticated" USING ("public"."can_delete_todo_list"("auth"."uid"(), "id"));
+
+
+
+CREATE POLICY "todo lists insert" ON "public"."todo_lists" FOR INSERT TO "authenticated" WITH CHECK (("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'cjb_manager'::"public"."app_role")));
 
 
 
 CREATE POLICY "todo lists read" ON "public"."todo_lists" FOR SELECT TO "authenticated" USING ("public"."can_access_todo_list"("auth"."uid"(), "id"));
+
+
+
+CREATE POLICY "todo lists update" ON "public"."todo_lists" FOR UPDATE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role") OR ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "id")))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role") OR ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "id"))));
 
 
 
@@ -6066,6 +6603,9 @@ ALTER TABLE "public"."todo_items" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."todo_list_assignments" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."todo_list_subcontractor_syncs" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."todo_lists" ENABLE ROW LEVEL SECURITY;
@@ -6489,6 +7029,18 @@ GRANT ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_clie
 
 
 
+GRANT ALL ON FUNCTION "public"."auto_assign_todo_list_creator"() TO "anon";
+GRANT ALL ON FUNCTION "public"."auto_assign_todo_list_creator"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."auto_assign_todo_list_creator"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."backfill_todo_list_subcontractor_sync"() TO "anon";
+GRANT ALL ON FUNCTION "public"."backfill_todo_list_subcontractor_sync"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."backfill_todo_list_subcontractor_sync"() TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."bump_revision"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."bump_revision"() TO "service_role";
 
@@ -6509,6 +7061,24 @@ GRANT ALL ON FUNCTION "public"."can_access_todo_item"("_user_id" "uuid", "_item_
 REVOKE ALL ON FUNCTION "public"."can_access_todo_list"("_user_id" "uuid", "_list_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."can_access_todo_list"("_user_id" "uuid", "_list_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_access_todo_list"("_user_id" "uuid", "_list_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."can_assign_todo_list"("_assigner_id" "uuid", "_list_id" "uuid", "_target_user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_assign_todo_list"("_assigner_id" "uuid", "_list_id" "uuid", "_target_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_assign_todo_list"("_assigner_id" "uuid", "_list_id" "uuid", "_target_user_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."can_delete_todo_list"("_user_id" "uuid", "_list_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_delete_todo_list"("_user_id" "uuid", "_list_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_delete_todo_list"("_user_id" "uuid", "_list_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."can_manage_rams_briefing"("_briefer_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_manage_rams_briefing"("_briefer_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_manage_rams_briefing"("_briefer_id" "uuid") TO "service_role";
 
 
 
@@ -6813,6 +7383,13 @@ GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to
 
 
 
+REVOKE ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") TO "service_role";
@@ -6947,6 +7524,12 @@ GRANT ALL ON FUNCTION "public"."set_updated_by"() TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "public"."shares_synced_subcontractor_staff_profile"("_viewer_id" "uuid", "_profile_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."shares_synced_subcontractor_staff_profile"("_viewer_id" "uuid", "_profile_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."shares_synced_subcontractor_staff_profile"("_viewer_id" "uuid", "_profile_id" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."shares_todo_list_with"("_user_id" "uuid", "_other_user_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."shares_todo_list_with"("_user_id" "uuid", "_other_user_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."shares_todo_list_with"("_user_id" "uuid", "_other_user_id" "uuid") TO "service_role";
@@ -6968,6 +7551,12 @@ GRANT ALL ON FUNCTION "public"."submission_owner"("_kind" "public"."submission_k
 GRANT ALL ON FUNCTION "public"."supplier_legal_name_key"("p_name" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."supplier_legal_name_key"("p_name" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."supplier_legal_name_key"("p_name" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."sync_todo_list_assignments_for_profile"() TO "anon";
+GRANT ALL ON FUNCTION "public"."sync_todo_list_assignments_for_profile"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."sync_todo_list_assignments_for_profile"() TO "service_role";
 
 
 
@@ -7371,6 +7960,12 @@ GRANT ALL ON TABLE "public"."todo_items" TO "service_role";
 GRANT ALL ON TABLE "public"."todo_list_assignments" TO "anon";
 GRANT ALL ON TABLE "public"."todo_list_assignments" TO "authenticated";
 GRANT ALL ON TABLE "public"."todo_list_assignments" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."todo_list_subcontractor_syncs" TO "anon";
+GRANT ALL ON TABLE "public"."todo_list_subcontractor_syncs" TO "authenticated";
+GRANT ALL ON TABLE "public"."todo_list_subcontractor_syncs" TO "service_role";
 
 
 
