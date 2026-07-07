@@ -569,6 +569,22 @@ $$;
 ALTER FUNCTION "public"."can_assign_todo_list"("_assigner_id" "uuid", "_list_id" "uuid", "_target_user_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."can_complete_todo_item"("_user_id" "uuid", "_item_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.todo_items ti
+    WHERE ti.id = _item_id
+      AND public.can_access_todo_list(_user_id, ti.list_id)
+  )
+$$;
+
+
+ALTER FUNCTION "public"."can_complete_todo_item"("_user_id" "uuid", "_item_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."can_delete_todo_list"("_user_id" "uuid", "_list_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -1338,6 +1354,50 @@ $_$;
 
 
 ALTER FUNCTION "public"."email_domain"("p_from" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."enforce_todo_item_update_permissions"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  _uid uuid := auth.uid();
+BEGIN
+  IF public.can_modify_todo_item(_uid, OLD.id) THEN
+    RETURN NEW;
+  END IF;
+
+  IF NOT public.can_complete_todo_item(_uid, OLD.id) THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+
+  IF NEW.list_id IS DISTINCT FROM OLD.list_id
+     OR NEW.title IS DISTINCT FROM OLD.title
+     OR NEW.notes IS DISTINCT FROM OLD.notes
+     OR NEW.created_by IS DISTINCT FROM OLD.created_by
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at
+  THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+
+  IF NEW.remind_at IS DISTINCT FROM OLD.remind_at
+     AND NOT (OLD.remind_at IS NOT NULL AND NEW.remind_at IS NULL)
+  THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+
+  IF NEW.reminder_sent_at IS DISTINCT FROM OLD.reminder_sent_at
+     AND NOT (OLD.reminder_sent_at IS NOT NULL AND NEW.reminder_sent_at IS NULL)
+  THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."enforce_todo_item_update_permissions"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."find_or_create_cost_supplier"("p_canonical_name" "text") RETURNS "uuid"
@@ -5373,6 +5433,10 @@ CREATE OR REPLACE TRIGGER "set_nas_sync_queue_updated_at" BEFORE UPDATE ON "publ
 
 
 
+CREATE OR REPLACE TRIGGER "todo_items_enforce_update_permissions" BEFORE UPDATE ON "public"."todo_items" FOR EACH ROW EXECUTE FUNCTION "public"."enforce_todo_item_update_permissions"();
+
+
+
 CREATE OR REPLACE TRIGGER "todo_items_set_updated_at" BEFORE UPDATE ON "public"."todo_items" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
 
 
@@ -6564,7 +6628,7 @@ CREATE POLICY "todo items read" ON "public"."todo_items" FOR SELECT TO "authenti
 
 
 
-CREATE POLICY "todo items update" ON "public"."todo_items" FOR UPDATE TO "authenticated" USING ("public"."can_modify_todo_item"("auth"."uid"(), "id")) WITH CHECK ("public"."can_modify_todo_item"("auth"."uid"(), "id"));
+CREATE POLICY "todo items update" ON "public"."todo_items" FOR UPDATE TO "authenticated" USING (("public"."can_modify_todo_item"("auth"."uid"(), "id") OR "public"."can_complete_todo_item"("auth"."uid"(), "id"))) WITH CHECK (("public"."can_modify_todo_item"("auth"."uid"(), "id") OR "public"."can_complete_todo_item"("auth"."uid"(), "id")));
 
 
 
@@ -7070,6 +7134,12 @@ GRANT ALL ON FUNCTION "public"."can_assign_todo_list"("_assigner_id" "uuid", "_l
 
 
 
+REVOKE ALL ON FUNCTION "public"."can_complete_todo_item"("_user_id" "uuid", "_item_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_complete_todo_item"("_user_id" "uuid", "_item_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_complete_todo_item"("_user_id" "uuid", "_item_id" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."can_delete_todo_list"("_user_id" "uuid", "_list_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."can_delete_todo_list"("_user_id" "uuid", "_list_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_delete_todo_list"("_user_id" "uuid", "_list_id" "uuid") TO "service_role";
@@ -7216,6 +7286,11 @@ GRANT ALL ON FUNCTION "public"."delete_integration_secret"("p_name" "text") TO "
 GRANT ALL ON FUNCTION "public"."email_domain"("p_from" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."email_domain"("p_from" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."email_domain"("p_from" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."enforce_todo_item_update_permissions"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."enforce_todo_item_update_permissions"() TO "service_role";
 
 
 
