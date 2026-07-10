@@ -175,7 +175,7 @@ $$;
 ALTER FUNCTION "public"."admin_set_vault_secret"("p_name" "text", "p_value" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT ''::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_payment_month" "text" DEFAULT NULL::"text") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT ''::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_f_credit_card" "text" DEFAULT ''::"text", "p_payment_month" "text" DEFAULT NULL::"text") RETURNS "jsonb"
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $_$
@@ -186,7 +186,7 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text" 
       ci,
       p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type, p_f_company,
       p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
-      p_f_project, p_f_check, p_dup_only, p_missing_due_date
+      p_f_project, p_f_check, p_dup_only, p_missing_due_date, p_f_credit_card
     )
   ),
   filtered_for_missing_count AS (
@@ -197,7 +197,8 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text" 
       p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type, p_f_company,
       p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
       p_f_project, p_f_check, p_dup_only,
-      false
+      false,
+      p_f_credit_card
     )
   ),
   missing_due_date_count AS (
@@ -224,9 +225,32 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text" 
   ),
   summary AS (
     SELECT
-      coalesce(sum(coalesce(f.total_amount, f.net_amount + coalesce(f.vat_amount, 0))), 0) AS spend,
+      coalesce(sum(
+        coalesce(
+          f.total_amount,
+          CASE
+            WHEN f.vat_treatment = 'reverse_charge' THEN
+              coalesce(f.net_amount, 0) - coalesce(f.cis_amount, 0)
+            ELSE
+              coalesce(f.net_amount, 0) + coalesce(f.vat_amount, 0)
+          END
+        )
+      ), 0) AS spend,
       coalesce(sum(CASE WHEN f.vat_treatment = 'standard_20' THEN coalesce(f.vat_amount, 0) ELSE 0 END), 0) AS input_vat,
-      coalesce(sum(CASE WHEN f.vat_treatment = 'reverse_charge' THEN coalesce(f.net_amount, 0) ELSE 0 END), 0) AS rc_net,
+      coalesce(sum(
+        CASE WHEN f.vat_treatment = 'reverse_charge' THEN
+          CASE
+            WHEN coalesce(f.vat_amount, 0) <> 0 THEN coalesce(f.vat_amount, 0)
+            WHEN f.net_amount IS NOT NULL AND f.net_amount <> 0 THEN
+              round(abs(f.net_amount) * 0.2, 2)
+              * CASE
+                  WHEN f.document_type = 'credit_note' OR f.net_amount < 0 THEN -1
+                  ELSE 1
+                END
+            ELSE 0
+          END
+        ELSE 0 END
+      ), 0) AS rc_vat,
       coalesce(sum(coalesce(f.cis_amount, 0)), 0) AS cis,
       count(*) FILTER (WHERE f.status = 'pending_review') AS pending,
       count(*) FILTER (WHERE f.is_duplicate OR f.has_duplicate_siblings) AS dupes,
@@ -240,7 +264,15 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text" 
       coalesce(f.net_amount, 0) AS net,
       coalesce(f.vat_amount, 0) AS vat,
       coalesce(f.cis_amount, 0) AS cis,
-      coalesce(f.total_amount, coalesce(f.net_amount, 0) + coalesce(f.vat_amount, 0)) AS total,
+      coalesce(
+        f.total_amount,
+        CASE
+          WHEN f.vat_treatment = 'reverse_charge' THEN
+            coalesce(f.net_amount, 0) - coalesce(f.cis_amount, 0)
+          ELSE
+            coalesce(f.net_amount, 0) + coalesce(f.vat_amount, 0)
+        END
+      ) AS total,
       f.paid_at,
       f.status,
       f.due_date,
@@ -286,7 +318,7 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text" 
       SELECT jsonb_build_object(
         'spend', s.spend,
         'inputVat', s.input_vat,
-        'rcNet', s.rc_net,
+        'rcVat', s.rc_vat,
         'cis', s.cis,
         'pending', s.pending,
         'dupes', s.dupes,
@@ -348,16 +380,17 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text" 
 $_$;
 
 
-ALTER FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_payment_month" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_payment_month" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."aggregate_invoices"("p_f_text" "text" DEFAULT ''::"text", "p_f_client" "uuid" DEFAULT NULL::"uuid", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_vat" "text" DEFAULT ''::"text", "p_f_project" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  WITH filtered AS (
+  WITH auth_guard AS (SELECT public.assert_rpc_admin() AS _), filtered AS (
     SELECT i.*
     FROM public.invoices i
+    CROSS JOIN auth_guard
     WHERE public.outgoing_invoice_passes_filters(
       i, p_f_text, p_f_client, p_f_from, p_f_to, p_f_vat, p_f_project
     )
@@ -407,6 +440,53 @@ $$;
 
 
 ALTER FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."assert_rpc_admin"() RETURNS boolean
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF auth.role() = 'service_role' THEN
+    RETURN true;
+  END IF;
+  IF auth.role() IS DISTINCT FROM 'authenticated' OR auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+  IF NOT (
+    public.has_role(auth.uid(), 'admin'::public.app_role)
+    OR public.has_role(auth.uid(), 'super_admin'::public.app_role)
+  ) THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+  RETURN true;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."assert_rpc_admin"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."assert_rpc_staff"() RETURNS boolean
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF auth.role() = 'service_role' THEN
+    RETURN true;
+  END IF;
+  IF auth.role() IS DISTINCT FROM 'authenticated' OR auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+  IF NOT public.is_staff(auth.uid()) THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+  RETURN true;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."assert_rpc_staff"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."auto_assign_todo_list_creator"() RETURNS "trigger"
@@ -802,6 +882,8 @@ CREATE TABLE IF NOT EXISTS "public"."cost_invoices" (
     "search_document" "tsvector",
     "payment_reminder_month" "text",
     "payment_reminder_dismissed_at" timestamp with time zone,
+    "credit_card_paid" boolean DEFAULT false NOT NULL,
+    "paid_by_credit_card" boolean DEFAULT false NOT NULL,
     CONSTRAINT "cost_invoices_document_type_check" CHECK (("document_type" = ANY (ARRAY['invoice'::"text", 'credit_note'::"text"])))
 );
 
@@ -814,6 +896,10 @@ COMMENT ON COLUMN "public"."cost_invoices"."payment_reminder_month" IS 'YYYY-MM 
 
 
 COMMENT ON COLUMN "public"."cost_invoices"."payment_reminder_dismissed_at" IS 'When a payment reminder was dismissed without marking invoices paid.';
+
+
+
+COMMENT ON COLUMN "public"."cost_invoices"."paid_by_credit_card" IS 'Invoice PDF filed under Costs/YYYY/MM/credit card/<Company>/ when true';
 
 
 
@@ -947,7 +1033,7 @@ $$;
 ALTER FUNCTION "public"."cost_invoice_norm_text"("p_value" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public"."cost_invoices", "p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean) RETURNS boolean
+CREATE OR REPLACE FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public"."cost_invoices", "p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text" DEFAULT ''::"text") RETURNS boolean
     LANGUAGE "sql" STABLE
     SET "search_path" TO 'public'
     AS $$
@@ -977,6 +1063,11 @@ CREATE OR REPLACE FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public
       coalesce(nullif(trim(p_f_paid), ''), NULL) IS NULL
       OR (p_f_paid = 'paid' AND p_ci.paid_at IS NOT NULL)
       OR (p_f_paid = 'unpaid' AND p_ci.paid_at IS NULL)
+    )
+    AND (
+      coalesce(nullif(trim(p_f_credit_card), ''), NULL) IS NULL
+      OR (p_f_credit_card = 'cc' AND p_ci.paid_by_credit_card = true)
+      OR (p_f_credit_card = 'not_cc' AND p_ci.paid_by_credit_card = false)
     )
     AND (
       coalesce(nullif(trim(p_f_cis), ''), NULL) IS NULL
@@ -1045,7 +1136,7 @@ CREATE OR REPLACE FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public
 $$;
 
 
-ALTER FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public"."cost_invoices", "p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean) OWNER TO "postgres";
+ALTER FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public"."cost_invoices", "p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."cost_invoice_sort_value"("p_row" "public"."cost_invoices", "p_sort_key" "text") RETURNS "text"
@@ -1363,6 +1454,11 @@ CREATE OR REPLACE FUNCTION "public"."enforce_todo_item_update_permissions"() RET
 DECLARE
   _uid uuid := auth.uid();
 BEGIN
+  -- Service role / internal cron (auth.uid() IS NULL) may update any column.
+  IF _uid IS NULL THEN
+    RETURN NEW;
+  END IF;
+
   IF public.can_modify_todo_item(_uid, OLD.id) THEN
     RETURN NEW;
   END IF;
@@ -1900,17 +1996,18 @@ CREATE OR REPLACE FUNCTION "public"."list_cost_duplicate_id_sets"() RETURNS TABL
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
+  WITH auth_guard AS (SELECT public.assert_rpc_admin() AS _)
   SELECT
     coalesce(array_agg(id) FILTER (WHERE is_duplicate), '{}'::uuid[]),
     coalesce(array_agg(id) FILTER (WHERE has_duplicate_siblings), '{}'::uuid[])
-  FROM public.cost_invoices
+  FROM public.cost_invoices, auth_guard;
 $$;
 
 
 ALTER FUNCTION "public"."list_cost_duplicate_id_sets"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT ''::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_sort_key" "text" DEFAULT 'received'::"text", "p_sort_dir" "text" DEFAULT 'desc'::"text", "p_f_company_exact" "text" DEFAULT NULL::"text") RETURNS TABLE("id" "uuid")
+CREATE OR REPLACE FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT ''::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_f_credit_card" "text" DEFAULT ''::"text", "p_sort_key" "text" DEFAULT 'received'::"text", "p_sort_dir" "text" DEFAULT 'desc'::"text", "p_f_company_exact" "text" DEFAULT NULL::"text") RETURNS TABLE("id" "uuid")
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
@@ -1921,7 +2018,7 @@ CREATE OR REPLACE FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" 
     p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type,
     coalesce(p_f_company_exact, p_f_company),
     p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
-    p_f_project, p_f_check, p_dup_only, p_missing_due_date
+    p_f_project, p_f_check, p_dup_only, p_missing_due_date, p_f_credit_card
   )
   ORDER BY
     CASE WHEN public.cost_invoice_sort_value(ci, p_sort_key) IS NULL THEN 1 ELSE 0 END,
@@ -1932,10 +2029,10 @@ CREATE OR REPLACE FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" 
 $$;
 
 
-ALTER FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_f_company_exact" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_sort_key" "text", "p_sort_dir" "text", "p_f_company_exact" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."list_cost_invoices"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT ''::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_sort_key" "text" DEFAULT 'received'::"text", "p_sort_dir" "text" DEFAULT 'desc'::"text", "p_limit" integer DEFAULT 20, "p_offset" integer DEFAULT 0, "p_unpaginated" boolean DEFAULT false, "p_cursor_sort_value" "text" DEFAULT NULL::"text", "p_cursor_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "status" "public"."cost_invoice_status", "company_name" "text", "company_name_raw" "text", "invoice_number" "text", "po_reference" "text", "invoice_date" "date", "due_date" "date", "due_date_rule" "text", "description" "text", "currency" "text", "net_amount" numeric, "vat_amount" numeric, "total_amount" numeric, "vat_treatment" "public"."cost_vat_treatment", "nas_path" "text", "nas_fallback_path" "text", "attachment_filename" "text", "attachment_sha256" "text", "source_email_from" "text", "source_subject" "text", "source_message_id" "text", "source_received_at" timestamp with time zone, "gemini_confidence" numeric, "is_duplicate" boolean, "duplicate_of" "uuid", "has_duplicate_siblings" boolean, "notes" "text", "created_at" timestamp with time zone, "updated_at" timestamp with time zone, "paid_at" timestamp with time zone, "cis_amount" numeric, "document_type" "text", "project_id" "uuid", "project_other" "text", "is_overhead" boolean, "subcontractor_id" "uuid", "timesheet_check_status" "text", "timesheet_check_at" timestamp with time zone, "timesheet_check_detail" "text", "company_invoice_key" "text", "invoice_number_key" "text", "invoice_format_key" "text", "supplier_email_domain" "text", "supplier_id" "uuid", "supplier_vat_number" "text", "supplier_company_reg_number" "text", "payment_reminded_at" timestamp with time zone, "full_field_dedupe_key" "text", "total_count" bigint)
+CREATE OR REPLACE FUNCTION "public"."list_cost_invoices"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT ''::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_f_credit_card" "text" DEFAULT ''::"text", "p_sort_key" "text" DEFAULT 'received'::"text", "p_sort_dir" "text" DEFAULT 'desc'::"text", "p_limit" integer DEFAULT 20, "p_offset" integer DEFAULT 0, "p_unpaginated" boolean DEFAULT false, "p_cursor_sort_value" "text" DEFAULT NULL::"text", "p_cursor_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "status" "public"."cost_invoice_status", "company_name" "text", "company_name_raw" "text", "invoice_number" "text", "po_reference" "text", "invoice_date" "date", "due_date" "date", "due_date_rule" "text", "description" "text", "currency" "text", "net_amount" numeric, "vat_amount" numeric, "total_amount" numeric, "vat_treatment" "public"."cost_vat_treatment", "nas_path" "text", "nas_fallback_path" "text", "attachment_filename" "text", "attachment_sha256" "text", "source_email_from" "text", "source_subject" "text", "source_message_id" "text", "source_received_at" timestamp with time zone, "gemini_confidence" numeric, "is_duplicate" boolean, "duplicate_of" "uuid", "has_duplicate_siblings" boolean, "notes" "text", "created_at" timestamp with time zone, "updated_at" timestamp with time zone, "paid_at" timestamp with time zone, "paid_by_credit_card" boolean, "cis_amount" numeric, "document_type" "text", "project_id" "uuid", "project_other" "text", "is_overhead" boolean, "subcontractor_id" "uuid", "timesheet_check_status" "text", "timesheet_check_at" timestamp with time zone, "timesheet_check_detail" "text", "company_invoice_key" "text", "invoice_number_key" "text", "invoice_format_key" "text", "supplier_email_domain" "text", "supplier_id" "uuid", "supplier_vat_number" "text", "supplier_company_reg_number" "text", "payment_reminded_at" timestamp with time zone, "full_field_dedupe_key" "text", "total_count" bigint)
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
@@ -1946,7 +2043,7 @@ CREATE OR REPLACE FUNCTION "public"."list_cost_invoices"("p_f_text" "text" DEFAU
       ci,
       p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type, p_f_company,
       p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
-      p_f_project, p_f_check, p_dup_only, p_missing_due_date
+      p_f_project, p_f_check, p_dup_only, p_missing_due_date, p_f_credit_card
     )
   ),
   ranked AS (
@@ -1993,11 +2090,11 @@ CREATE OR REPLACE FUNCTION "public"."list_cost_invoices"("p_f_text" "text" DEFAU
   SELECT
     o.id, o.status, o.company_name, o.company_name_raw, o.invoice_number, o.po_reference,
     o.invoice_date, o.due_date, o.due_date_rule, o.description, o.currency,
-    o.net_amount, o.vat_amount, o.total_amount, o.vat_treatment,
-    o.nas_path, o.nas_fallback_path, o.attachment_filename, o.attachment_sha256,
-    o.source_email_from, o.source_subject, o.source_message_id, o.source_received_at,
-    o.gemini_confidence, o.is_duplicate, o.duplicate_of, o.has_duplicate_siblings,
-    o.notes, o.created_at, o.updated_at, o.paid_at, o.cis_amount, o.document_type,
+    o.net_amount, o.vat_amount, o.total_amount, o.vat_treatment, o.nas_path,
+    o.nas_fallback_path, o.attachment_filename, o.attachment_sha256, o.source_email_from,
+    o.source_subject, o.source_message_id, o.source_received_at, o.gemini_confidence,
+    o.is_duplicate, o.duplicate_of, o.has_duplicate_siblings, o.notes, o.created_at,
+    o.updated_at, o.paid_at, o.paid_by_credit_card, o.cis_amount, o.document_type,
     o.project_id, o.project_other, o.is_overhead, o.subcontractor_id,
     o.timesheet_check_status, o.timesheet_check_at, o.timesheet_check_detail,
     o.company_invoice_key, o.invoice_number_key, o.invoice_format_key,
@@ -2014,16 +2111,17 @@ CREATE OR REPLACE FUNCTION "public"."list_cost_invoices"("p_f_text" "text" DEFAU
 $$;
 
 
-ALTER FUNCTION "public"."list_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer, "p_unpaginated" boolean, "p_cursor_sort_value" "text", "p_cursor_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."list_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_sort_key" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer, "p_unpaginated" boolean, "p_cursor_sort_value" "text", "p_cursor_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."list_cost_payment_remittances"("p_company" "text" DEFAULT ''::"text", "p_paid_from" "date" DEFAULT NULL::"date", "p_paid_to" "date" DEFAULT NULL::"date", "p_limit" integer DEFAULT 20, "p_offset" integer DEFAULT 0) RETURNS TABLE("id" "uuid", "company_name" "text", "paid_at" timestamp with time zone, "nas_path" "text", "total_net" numeric, "total_vat" numeric, "total_amount" numeric, "invoice_count" integer, "lines" "jsonb", "created_at" timestamp with time zone, "total_count" bigint)
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  WITH filtered AS (
+  WITH auth_guard AS (SELECT public.assert_rpc_admin() AS _), filtered AS (
     SELECT r.*
     FROM public.cost_payment_remittances r
+    CROSS JOIN auth_guard
     WHERE
       (coalesce(nullif(trim(p_company), ''), NULL) IS NULL OR r.company_name = trim(p_company))
       AND (p_paid_from IS NULL OR r.paid_at::date >= p_paid_from)
@@ -2059,9 +2157,10 @@ CREATE OR REPLACE FUNCTION "public"."list_invoices"("p_f_text" "text" DEFAULT ''
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  WITH filtered AS (
+  WITH auth_guard AS (SELECT public.assert_rpc_admin() AS _), filtered AS (
     SELECT i.*
     FROM public.invoices i
+    CROSS JOIN auth_guard
     WHERE public.outgoing_invoice_passes_filters(
       i, p_f_text, p_f_client, p_f_from, p_f_to, p_f_vat, p_f_project
     )
@@ -2122,7 +2221,7 @@ CREATE OR REPLACE FUNCTION "public"."list_submissions_browser"("p_from" "date", 
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  WITH base AS (
+  WITH auth_guard AS (SELECT public.assert_rpc_staff() AS _), base AS (
     SELECT
       'timesheet'::text AS kind,
       t.id,
@@ -2352,7 +2451,7 @@ CREATE OR REPLACE FUNCTION "public"."list_submissions_browser"("p_from" "date", 
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  WITH base AS (
+  WITH auth_guard AS (SELECT public.assert_rpc_staff() AS _), base AS (
     SELECT
       'timesheet'::text AS kind,
       t.id,
@@ -2611,7 +2710,7 @@ END; $$;
 ALTER FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT 'unpaid'::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_paid" boolean DEFAULT true, "p_selected_ids" "uuid"[] DEFAULT NULL::"uuid"[]) RETURNS TABLE("updated_count" bigint, "snapshot" "jsonb")
+CREATE OR REPLACE FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT 'unpaid'::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_f_credit_card" "text" DEFAULT ''::"text", "p_paid" boolean DEFAULT true, "p_selected_ids" "uuid"[] DEFAULT NULL::"uuid"[]) RETURNS TABLE("updated_count" bigint, "snapshot" "jsonb")
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
@@ -2628,7 +2727,7 @@ BEGIN
         ci,
         p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type, p_f_company,
         p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
-        p_f_project, p_f_check, p_dup_only, p_missing_due_date
+        p_f_project, p_f_check, p_dup_only, p_missing_due_date, p_f_credit_card
       )
   ),
   snap AS (
@@ -2662,7 +2761,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[]) OWNER TO "postgres";
+ALTER FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_paid" boolean, "p_selected_ids" "uuid"[]) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."match_subcontractor_by_company"("p_company" "text") RETURNS "uuid"
@@ -2910,6 +3009,7 @@ DECLARE
   v_ci_keys text[];
   v_full_refresh boolean;
 BEGIN
+  IF auth.role() = 'authenticated' THEN PERFORM public.assert_rpc_admin(); END IF;
   v_full_refresh := p_full_keys IS NULL AND p_ci_keys IS NULL;
 
   IF v_full_refresh THEN
@@ -3020,13 +3120,28 @@ CREATE OR REPLACE FUNCTION "public"."resolve_company_from_costs_table"("p_domain
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-DECLARE v_pdf_key text; v_resolved text; v_total bigint; v_winner_cnt bigint; v_winner_name text; v_distinct int;
+DECLARE
+  v_pdf_key text;
+  v_resolved text;
+  v_total bigint;
+  v_winner_cnt bigint;
+  v_winner_name text;
+  v_distinct int;
 BEGIN
-  IF p_pdf_name IS NOT NULL AND btrim(p_pdf_name) <> '' AND upper(btrim(p_pdf_name)) <> 'NA' THEN
+  IF p_pdf_name IS NOT NULL
+     AND btrim(p_pdf_name) <> ''
+     AND upper(btrim(p_pdf_name)) <> 'NA' THEN
     v_pdf_key := public.company_match_key(p_pdf_name);
     IF v_pdf_key IS NOT NULL AND v_pdf_key <> '' THEN
+      SELECT a.canonical_name INTO v_resolved FROM public.cost_company_aliases a WHERE a.match_key = v_pdf_key;
+      IF v_resolved IS NOT NULL THEN RETURN v_resolved; END IF;
       v_resolved := public.most_common_cost_company_name(v_pdf_key);
       IF v_resolved IS NOT NULL THEN RETURN v_resolved; END IF;
+      SELECT ci.company_name_raw INTO v_resolved FROM public.cost_invoices ci
+       WHERE public.company_match_key(ci.company_name_raw) = v_pdf_key
+         AND ci.company_name_raw IS NOT NULL AND btrim(ci.company_name_raw) <> '' AND upper(btrim(ci.company_name_raw)) <> 'NA'
+       GROUP BY ci.company_name_raw ORDER BY count(*) DESC, max(ci.created_at) DESC LIMIT 1;
+      IF v_resolved IS NOT NULL THEN RETURN btrim(v_resolved); END IF;
     END IF;
   END IF;
   IF p_domain IS NOT NULL AND btrim(p_domain) <> '' AND p_format_key IS NOT NULL AND btrim(p_format_key) <> '' THEN
@@ -3034,7 +3149,12 @@ BEGIN
      WHERE ci.supplier_email_domain = p_domain AND ci.invoice_format_key = p_format_key
        AND ci.company_name IS NOT NULL AND btrim(ci.company_name) <> '' AND upper(btrim(ci.company_name)) <> 'NA'
      GROUP BY ci.company_name ORDER BY count(*) DESC, max(ci.created_at) DESC LIMIT 1;
-    IF v_resolved IS NOT NULL THEN RETURN v_resolved; END IF;
+    IF v_resolved IS NOT NULL THEN
+      IF p_pdf_name IS NULL OR btrim(p_pdf_name) = '' OR upper(btrim(p_pdf_name)) = 'NA'
+         OR public.company_match_key(p_pdf_name) = public.company_match_key(v_resolved) THEN
+        RETURN v_resolved;
+      END IF;
+    END IF;
   END IF;
   IF p_format_key IS NOT NULL AND btrim(p_format_key) <> '' THEN
     SELECT count(*)::bigint, count(DISTINCT ci.company_name)::int INTO v_total, v_distinct
@@ -3057,7 +3177,8 @@ BEGIN
     END IF;
   END IF;
   RETURN NULL;
-END; $$;
+END;
+$$;
 
 
 ALTER FUNCTION "public"."resolve_company_from_costs_table"("p_domain" "text", "p_format_key" "text", "p_pdf_name" "text") OWNER TO "postgres";
@@ -3494,14 +3615,7 @@ CREATE OR REPLACE FUNCTION "public"."timesheet_days_touch_parent"() RETURNS "tri
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-DECLARE
-  v_id uuid;
 BEGIN
-  v_id := COALESCE(NEW.timesheet_id, OLD.timesheet_id);
-  -- Re-snapshot by bumping approved_at on parent when it's approved (trigger above re-snapshots)
-  UPDATE public.timesheets
-    SET approved_at = now()
-    WHERE id = v_id AND status = 'approved';
   RETURN COALESCE(NEW, OLD);
 END;
 $$;
@@ -3550,8 +3664,7 @@ BEGIN
     IF TG_OP = 'INSERT' THEN
       NEW.snapshot_shift_rate := COALESCE(v_rate, 0);
     ELSIF TG_OP = 'UPDATE' THEN
-      IF OLD.status <> 'approved' OR OLD.snapshot_shift_rate IS NULL
-         OR NEW.approved_at IS DISTINCT FROM OLD.approved_at THEN
+      IF OLD.status <> 'approved' OR OLD.snapshot_shift_rate IS NULL THEN
         NEW.snapshot_shift_rate := COALESCE(v_rate, 0);
       END IF;
     END IF;
@@ -5253,7 +5366,7 @@ CREATE INDEX "todo_item_attachments_item_idx" ON "public"."todo_item_attachments
 
 
 
-CREATE INDEX "todo_items_due_reminder_idx" ON "public"."todo_items" USING "btree" ("remind_at") WHERE (("remind_at" IS NOT NULL) AND ("reminder_sent_at" IS NULL) AND ("completed_at" IS NULL));
+CREATE INDEX "todo_items_due_reminder_idx" ON "public"."todo_items" USING "btree" ("remind_at") WHERE (("remind_at" IS NOT NULL) AND ("completed_at" IS NULL));
 
 
 
@@ -5273,7 +5386,7 @@ CREATE INDEX "todo_list_subcontractor_syncs_sub_idx" ON "public"."todo_list_subc
 
 
 
-CREATE INDEX "todo_lists_due_reminder_idx" ON "public"."todo_lists" USING "btree" ("remind_at") WHERE (("remind_at" IS NOT NULL) AND ("reminder_sent_at" IS NULL) AND ("archived_at" IS NULL));
+CREATE INDEX "todo_lists_due_reminder_idx" ON "public"."todo_lists" USING "btree" ("remind_at") WHERE (("remind_at" IS NOT NULL) AND ("archived_at" IS NULL));
 
 
 
@@ -7079,27 +7192,36 @@ GRANT ALL ON FUNCTION "public"."admin_set_vault_secret"("p_name" "text", "p_valu
 
 
 
-REVOKE ALL ON FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_payment_month" "text") FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_payment_month" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_payment_month" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_payment_month" "text") TO "service_role";
+REVOKE ALL ON FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_payment_month" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_payment_month" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_payment_month" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_payment_month" "text") TO "service_role";
 
 
 
 REVOKE ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."auto_assign_todo_list_creator"() TO "anon";
+REVOKE ALL ON FUNCTION "public"."assert_rpc_admin"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."assert_rpc_admin"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."assert_rpc_staff"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."assert_rpc_staff"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."auto_assign_todo_list_creator"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."auto_assign_todo_list_creator"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."auto_assign_todo_list_creator"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."backfill_todo_list_subcontractor_sync"() TO "anon";
+REVOKE ALL ON FUNCTION "public"."backfill_todo_list_subcontractor_sync"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."backfill_todo_list_subcontractor_sync"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."backfill_todo_list_subcontractor_sync"() TO "service_role";
 
@@ -7223,9 +7345,9 @@ GRANT ALL ON FUNCTION "public"."cost_invoice_norm_text"("p_value" "text") TO "se
 
 
 
-GRANT ALL ON FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public"."cost_invoices", "p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean) TO "anon";
-GRANT ALL ON FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public"."cost_invoices", "p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public"."cost_invoices", "p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean) TO "service_role";
+GRANT ALL ON FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public"."cost_invoices", "p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public"."cost_invoices", "p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public"."cost_invoices", "p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text") TO "service_role";
 
 
 
@@ -7235,7 +7357,7 @@ GRANT ALL ON FUNCTION "public"."cost_invoice_sort_value"("p_row" "public"."cost_
 
 
 
-GRANT ALL ON FUNCTION "public"."cost_invoices_after_write_refresh_duplicate_flags"() TO "anon";
+REVOKE ALL ON FUNCTION "public"."cost_invoices_after_write_refresh_duplicate_flags"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."cost_invoices_after_write_refresh_duplicate_flags"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."cost_invoices_after_write_refresh_duplicate_flags"() TO "service_role";
 
@@ -7259,7 +7381,6 @@ GRANT ALL ON FUNCTION "public"."cost_invoices_set_full_field_dedupe_key_trigger"
 
 
 REVOKE ALL ON FUNCTION "public"."count_pending_timesheet_reviews"() FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."count_pending_timesheet_reviews"() TO "anon";
 GRANT ALL ON FUNCTION "public"."count_pending_timesheet_reviews"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."count_pending_timesheet_reviews"() TO "service_role";
 
@@ -7271,7 +7392,6 @@ GRANT ALL ON FUNCTION "public"."daily_briefing_autoapprove"() TO "service_role";
 
 
 REVOKE ALL ON FUNCTION "public"."delete_cost_payment_remittances_for_invoices"("p_invoice_ids" "uuid"[]) FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."delete_cost_payment_remittances_for_invoices"("p_invoice_ids" "uuid"[]) TO "anon";
 GRANT ALL ON FUNCTION "public"."delete_cost_payment_remittances_for_invoices"("p_invoice_ids" "uuid"[]) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."delete_cost_payment_remittances_for_invoices"("p_invoice_ids" "uuid"[]) TO "service_role";
 
@@ -7294,7 +7414,7 @@ GRANT ALL ON FUNCTION "public"."enforce_todo_item_update_permissions"() TO "serv
 
 
 
-GRANT ALL ON FUNCTION "public"."find_or_create_cost_supplier"("p_canonical_name" "text") TO "anon";
+REVOKE ALL ON FUNCTION "public"."find_or_create_cost_supplier"("p_canonical_name" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."find_or_create_cost_supplier"("p_canonical_name" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."find_or_create_cost_supplier"("p_canonical_name" "text") TO "service_role";
 
@@ -7411,70 +7531,66 @@ GRANT ALL ON FUNCTION "public"."is_staff"("_user_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") TO "anon";
+REVOKE ALL ON FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."list_cost_duplicate_id_sets"() TO "anon";
+REVOKE ALL ON FUNCTION "public"."list_cost_duplicate_id_sets"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."list_cost_duplicate_id_sets"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."list_cost_duplicate_id_sets"() TO "service_role";
 
 
 
-REVOKE ALL ON FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_f_company_exact" "text") FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_f_company_exact" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_f_company_exact" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_f_company_exact" "text") TO "service_role";
+REVOKE ALL ON FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_sort_key" "text", "p_sort_dir" "text", "p_f_company_exact" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_sort_key" "text", "p_sort_dir" "text", "p_f_company_exact" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_sort_key" "text", "p_sort_dir" "text", "p_f_company_exact" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_cost_invoice_ids_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_sort_key" "text", "p_sort_dir" "text", "p_f_company_exact" "text") TO "service_role";
 
 
 
-REVOKE ALL ON FUNCTION "public"."list_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer, "p_unpaginated" boolean, "p_cursor_sort_value" "text", "p_cursor_id" "uuid") FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."list_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer, "p_unpaginated" boolean, "p_cursor_sort_value" "text", "p_cursor_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."list_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer, "p_unpaginated" boolean, "p_cursor_sort_value" "text", "p_cursor_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."list_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_sort_key" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer, "p_unpaginated" boolean, "p_cursor_sort_value" "text", "p_cursor_id" "uuid") TO "service_role";
+REVOKE ALL ON FUNCTION "public"."list_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_sort_key" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer, "p_unpaginated" boolean, "p_cursor_sort_value" "text", "p_cursor_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."list_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_sort_key" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer, "p_unpaginated" boolean, "p_cursor_sort_value" "text", "p_cursor_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."list_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_sort_key" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer, "p_unpaginated" boolean, "p_cursor_sort_value" "text", "p_cursor_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_sort_key" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer, "p_unpaginated" boolean, "p_cursor_sort_value" "text", "p_cursor_id" "uuid") TO "service_role";
 
 
 
 REVOKE ALL ON FUNCTION "public"."list_cost_payment_remittances"("p_company" "text", "p_paid_from" "date", "p_paid_to" "date", "p_limit" integer, "p_offset" integer) FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."list_cost_payment_remittances"("p_company" "text", "p_paid_from" "date", "p_paid_to" "date", "p_limit" integer, "p_offset" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."list_cost_payment_remittances"("p_company" "text", "p_paid_from" "date", "p_paid_to" "date", "p_limit" integer, "p_offset" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."list_cost_payment_remittances"("p_company" "text", "p_paid_from" "date", "p_paid_to" "date", "p_limit" integer, "p_offset" integer) TO "service_role";
 
 
 
 REVOKE ALL ON FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) TO "service_role";
 
 
 
 REVOKE ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer) FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer) TO "service_role";
 
 
 
 REVOKE ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid") FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") TO "anon";
+REVOKE ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") TO "service_role";
 
 
 
-REVOKE ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[]) FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[]) TO "anon";
-GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[]) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[]) TO "service_role";
+REVOKE ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_paid" boolean, "p_selected_ids" "uuid"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_paid" boolean, "p_selected_ids" "uuid"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_paid" boolean, "p_selected_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_paid" boolean, "p_selected_ids" "uuid"[]) TO "service_role";
 
 
 
@@ -7483,7 +7599,7 @@ GRANT ALL ON FUNCTION "public"."match_subcontractor_by_company"("p_company" "tex
 
 
 
-GRANT ALL ON FUNCTION "public"."most_common_cost_company_name"("p_match_key" "text") TO "anon";
+REVOKE ALL ON FUNCTION "public"."most_common_cost_company_name"("p_match_key" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."most_common_cost_company_name"("p_match_key" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."most_common_cost_company_name"("p_match_key" "text") TO "service_role";
 
@@ -7520,7 +7636,7 @@ GRANT ALL ON FUNCTION "public"."parse_description_filter_terms"("p_f_description
 
 
 
-GRANT ALL ON FUNCTION "public"."pick_domain_canonical"("p_domain" "text") TO "anon";
+REVOKE ALL ON FUNCTION "public"."pick_domain_canonical"("p_domain" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."pick_domain_canonical"("p_domain" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."pick_domain_canonical"("p_domain" "text") TO "service_role";
 
@@ -7532,19 +7648,18 @@ GRANT ALL ON FUNCTION "public"."profiles_guard_sensitive_self_update"() TO "serv
 
 
 REVOKE ALL ON FUNCTION "public"."refresh_cost_invoice_duplicate_flags"("p_full_keys" "text"[], "p_ci_keys" "text"[]) FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."refresh_cost_invoice_duplicate_flags"("p_full_keys" "text"[], "p_ci_keys" "text"[]) TO "anon";
 GRANT ALL ON FUNCTION "public"."refresh_cost_invoice_duplicate_flags"("p_full_keys" "text"[], "p_ci_keys" "text"[]) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."refresh_cost_invoice_duplicate_flags"("p_full_keys" "text"[], "p_ci_keys" "text"[]) TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."resolve_company_from_costs_table"("p_domain" "text", "p_format_key" "text", "p_pdf_name" "text") TO "anon";
+REVOKE ALL ON FUNCTION "public"."resolve_company_from_costs_table"("p_domain" "text", "p_format_key" "text", "p_pdf_name" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."resolve_company_from_costs_table"("p_domain" "text", "p_format_key" "text", "p_pdf_name" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."resolve_company_from_costs_table"("p_domain" "text", "p_format_key" "text", "p_pdf_name" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."resolve_company_from_invoice_series"("p_from" "text", "p_invoice_number" "text") TO "anon";
+REVOKE ALL ON FUNCTION "public"."resolve_company_from_invoice_series"("p_from" "text", "p_invoice_number" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."resolve_company_from_invoice_series"("p_from" "text", "p_invoice_number" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."resolve_company_from_invoice_series"("p_from" "text", "p_invoice_number" "text") TO "service_role";
 
@@ -7561,13 +7676,13 @@ GRANT ALL ON FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text
 
 
 
-GRANT ALL ON FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text", "p_invoice_number" "text") TO "anon";
+REVOKE ALL ON FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text", "p_invoice_number" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text", "p_invoice_number" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."resolve_cost_company_for_invoice"("p_name" "text", "p_from" "text", "p_invoice_number" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."resolve_cost_supplier_for_invoice"("p_vat" "text", "p_company_reg" "text", "p_name" "text", "p_from" "text", "p_invoice_number" "text", "p_source_invoice_id" "uuid") TO "anon";
+REVOKE ALL ON FUNCTION "public"."resolve_cost_supplier_for_invoice"("p_vat" "text", "p_company_reg" "text", "p_name" "text", "p_from" "text", "p_invoice_number" "text", "p_source_invoice_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."resolve_cost_supplier_for_invoice"("p_vat" "text", "p_company_reg" "text", "p_name" "text", "p_from" "text", "p_invoice_number" "text", "p_source_invoice_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."resolve_cost_supplier_for_invoice"("p_vat" "text", "p_company_reg" "text", "p_name" "text", "p_from" "text", "p_invoice_number" "text", "p_source_invoice_id" "uuid") TO "service_role";
 
@@ -7629,7 +7744,7 @@ GRANT ALL ON FUNCTION "public"."supplier_legal_name_key"("p_name" "text") TO "se
 
 
 
-GRANT ALL ON FUNCTION "public"."sync_todo_list_assignments_for_profile"() TO "anon";
+REVOKE ALL ON FUNCTION "public"."sync_todo_list_assignments_for_profile"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."sync_todo_list_assignments_for_profile"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."sync_todo_list_assignments_for_profile"() TO "service_role";
 
@@ -7668,7 +7783,7 @@ GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."upsert_cost_supplier_identifiers"("p_supplier_id" "uuid", "p_vat" "text", "p_company_reg" "text", "p_name" "text", "p_source_invoice_id" "uuid") TO "anon";
+REVOKE ALL ON FUNCTION "public"."upsert_cost_supplier_identifiers"("p_supplier_id" "uuid", "p_vat" "text", "p_company_reg" "text", "p_name" "text", "p_source_invoice_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."upsert_cost_supplier_identifiers"("p_supplier_id" "uuid", "p_vat" "text", "p_company_reg" "text", "p_name" "text", "p_source_invoice_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."upsert_cost_supplier_identifiers"("p_supplier_id" "uuid", "p_vat" "text", "p_company_reg" "text", "p_name" "text", "p_source_invoice_id" "uuid") TO "service_role";
 
