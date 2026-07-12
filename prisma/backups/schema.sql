@@ -4770,6 +4770,27 @@ CREATE TABLE IF NOT EXISTS "public"."vehicles" (
 ALTER TABLE "public"."vehicles" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."website_contact_email_account" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "email_address" "text" DEFAULT ''::"text" NOT NULL,
+    "auth_method" "text" DEFAULT 'oauth2'::"text" NOT NULL,
+    "smtp_host" "text" DEFAULT 'smtp.gmail.com'::"text" NOT NULL,
+    "smtp_port" integer DEFAULT 465 NOT NULL,
+    "password_secret" "text",
+    "refresh_token_secret" "text",
+    "has_credentials" boolean DEFAULT false NOT NULL,
+    "last_test_ok" boolean,
+    "last_test_at" timestamp with time zone,
+    "last_test_error" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "website_contact_email_account_auth_method_check" CHECK (("auth_method" = ANY (ARRAY['imap'::"text", 'oauth2'::"text"])))
+);
+
+
+ALTER TABLE "public"."website_contact_email_account" OWNER TO "postgres";
+
+
 ALTER TABLE ONLY "public"."cost_scan_state" ALTER COLUMN "id" SET DEFAULT "nextval"('"public"."cost_scan_state_id_seq"'::"regclass");
 
 
@@ -5174,6 +5195,11 @@ ALTER TABLE ONLY "public"."vehicles"
 
 
 
+ALTER TABLE ONLY "public"."website_contact_email_account"
+    ADD CONSTRAINT "website_contact_email_account_pkey" PRIMARY KEY ("id");
+
+
+
 CREATE INDEX "cost_invoices_company_idx" ON "public"."cost_invoices" USING "btree" ("lower"("company_name"));
 
 
@@ -5414,6 +5440,10 @@ CREATE INDEX "vehicle_defects_worker_id_inspection_date_idx" ON "public"."vehicl
 
 
 
+CREATE UNIQUE INDEX "website_contact_email_singleton" ON "public"."website_contact_email_account" USING "btree" ((true));
+
+
+
 CREATE OR REPLACE TRIGGER "bump_revision_trg" BEFORE UPDATE ON "public"."daily_briefings" FOR EACH ROW EXECUTE FUNCTION "public"."bump_revision"();
 
 
@@ -5603,6 +5633,10 @@ CREATE OR REPLACE TRIGGER "trg_timesheet_days_touch_parent" AFTER INSERT OR DELE
 
 
 CREATE OR REPLACE TRIGGER "trg_timesheets_snapshot" BEFORE INSERT OR UPDATE ON "public"."timesheets" FOR EACH ROW EXECUTE FUNCTION "public"."timesheets_snapshot_and_autoapprove"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_website_contact_email_account_updated" BEFORE UPDATE ON "public"."website_contact_email_account" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
@@ -6627,6 +6661,10 @@ CREATE POLICY "super_admin manage storage backends" ON "public"."integration_sto
 
 
 
+CREATE POLICY "super_admin manage website contact email" ON "public"."website_contact_email_account" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"));
+
+
+
 CREATE POLICY "tbx admin delete" ON "public"."toolbox_talks" FOR DELETE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
@@ -6880,6 +6918,9 @@ CREATE POLICY "vehicles admin write" ON "public"."vehicles" TO "authenticated" U
 
 CREATE POLICY "vehicles read authed" ON "public"."vehicles" FOR SELECT TO "authenticated" USING (true);
 
+
+
+ALTER TABLE "public"."website_contact_email_account" ENABLE ROW LEVEL SECURITY;
 
 
 
@@ -8210,6 +8251,12 @@ GRANT ALL ON TABLE "public"."vehicle_defects" TO "service_role";
 GRANT ALL ON TABLE "public"."vehicles" TO "anon";
 GRANT ALL ON TABLE "public"."vehicles" TO "authenticated";
 GRANT ALL ON TABLE "public"."vehicles" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."website_contact_email_account" TO "anon";
+GRANT ALL ON TABLE "public"."website_contact_email_account" TO "authenticated";
+GRANT ALL ON TABLE "public"."website_contact_email_account" TO "service_role";
 
 
 

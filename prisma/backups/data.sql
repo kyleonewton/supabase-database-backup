@@ -4,7 +4,7 @@ SET session_replication_role = replica;
 -- PostgreSQL database dump
 --
 
--- \restrict gT20swi37NQp4mBQ1g6HegBdC1IGPdmWvcpJRRrPqaTVl5XaYcDec39eH4lsdLj
+-- \restrict YSHlIArCloU3bgboMJnjzXKsgkKo8MYEBSvpP3e45KJXRF4e1YCXV40m5lat9p2
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.6
@@ -11233,6 +11233,15 @@ eb6bc71f-6bba-45a0-a0cd-e3377b5a322f	50a15673-c44f-4aba-9ed0-3490157e4818	20	Loa
 
 
 --
+-- Data for Name: website_contact_email_account; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY "public"."website_contact_email_account" ("id", "email_address", "auth_method", "smtp_host", "smtp_port", "password_secret", "refresh_token_secret", "has_credentials", "last_test_ok", "last_test_at", "last_test_error", "created_at", "updated_at") FROM stdin;
+ffc62a9d-8b6b-46f1-8107-fed4a016e5fe		oauth2	smtp.gmail.com	465	\N	\N	f	\N	\N	\N	2026-07-12 19:56:21.255795+00	2026-07-12 19:56:21.255795+00
+\.
+
+
+--
 -- Data for Name: buckets; Type: TABLE DATA; Schema: storage; Owner: supabase_storage_admin
 --
 
@@ -11352,6 +11361,6 @@ SELECT pg_catalog.setval('"supabase_functions"."hooks_id_seq"', 5, true);
 -- PostgreSQL database dump complete
 --
 
--- \unrestrict gT20swi37NQp4mBQ1g6HegBdC1IGPdmWvcpJRRrPqaTVl5XaYcDec39eH4lsdLj
+-- \unrestrict YSHlIArCloU3bgboMJnjzXKsgkKo8MYEBSvpP3e45KJXRF4e1YCXV40m5lat9p2
 
 RESET ALL;
