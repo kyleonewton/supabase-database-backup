@@ -3734,6 +3734,47 @@ $$;
 ALTER FUNCTION "public"."trusted_supplier_email_domain"("p_from" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."update_cost_payment_remittance_nas_path"("p_invoice_ids" "uuid"[], "p_nas_path" "text") RETURNS "uuid"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  target_id uuid;
+BEGIN
+  IF p_invoice_ids IS NULL OR cardinality(p_invoice_ids) = 0 OR p_nas_path IS NULL OR trim(p_nas_path) = '' THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT r.id INTO target_id
+  FROM public.cost_payment_remittances r
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM unnest(p_invoice_ids) AS inv_id
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(r.lines) elem
+      WHERE (elem->>'invoice_id')::uuid = inv_id
+    )
+  )
+  ORDER BY r.created_at DESC
+  LIMIT 1;
+
+  IF target_id IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  UPDATE public.cost_payment_remittances
+  SET nas_path = trim(p_nas_path)
+  WHERE id = target_id;
+
+  RETURN target_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."update_cost_payment_remittance_nas_path"("p_invoice_ids" "uuid"[], "p_nas_path" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."update_updated_at_column"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     SET "search_path" TO 'public'
@@ -3917,7 +3958,7 @@ CREATE TABLE IF NOT EXISTS "public"."cost_payment_remittances" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "company_name" "text" NOT NULL,
     "paid_at" timestamp with time zone NOT NULL,
-    "nas_path" "text" NOT NULL,
+    "nas_path" "text",
     "total_net" numeric(12,2),
     "total_vat" numeric(12,2),
     "total_amount" numeric(12,2) DEFAULT 0 NOT NULL,
@@ -4322,7 +4363,8 @@ CREATE TABLE IF NOT EXISTS "public"."notification_preferences" (
     "timesheet_submit_reminder" boolean DEFAULT true NOT NULL,
     "havs_submit_reminder" boolean DEFAULT true NOT NULL,
     "vehicle_service_due" boolean DEFAULT true NOT NULL,
-    "todo_reminder" boolean DEFAULT true NOT NULL
+    "todo_reminder" boolean DEFAULT true NOT NULL,
+    "cost_payment_made" boolean DEFAULT true NOT NULL
 );
 
 
@@ -7815,6 +7857,13 @@ GRANT ALL ON FUNCTION "public"."trigger_cost_scan"("p_url" "text", "p_apikey" "t
 GRANT ALL ON FUNCTION "public"."trusted_supplier_email_domain"("p_from" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."trusted_supplier_email_domain"("p_from" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."trusted_supplier_email_domain"("p_from" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."update_cost_payment_remittance_nas_path"("p_invoice_ids" "uuid"[], "p_nas_path" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."update_cost_payment_remittance_nas_path"("p_invoice_ids" "uuid"[], "p_nas_path" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_cost_payment_remittance_nas_path"("p_invoice_ids" "uuid"[], "p_nas_path" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_cost_payment_remittance_nas_path"("p_invoice_ids" "uuid"[], "p_nas_path" "text") TO "service_role";
 
 
 
