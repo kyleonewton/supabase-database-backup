@@ -1570,6 +1570,42 @@ $$;
 ALTER FUNCTION "public"."get_integration_secret"("p_name" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."get_user_permissions"("_user_id" "uuid") RETURNS "text"[]
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT CASE
+    WHEN public.is_super_admin(_user_id) THEN
+      (SELECT array_agg(key ORDER BY key) FROM public.app_permissions)
+    ELSE
+      (
+        SELECT coalesce(array_agg(DISTINCT arp.permission_key ORDER BY arp.permission_key), '{}')
+        FROM public.user_roles ur
+        JOIN public.app_role_permissions arp ON arp.role_id = ur.role_id
+        WHERE ur.user_id = _user_id
+      )
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."get_user_permissions"("_user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_user_role_slug"("_user_id" "uuid") RETURNS "text"
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT ar.slug
+  FROM public.user_roles ur
+  JOIN public.app_roles ar ON ar.id = ur.role_id
+  WHERE ur.user_id = _user_id
+  LIMIT 1;
+$$;
+
+
+ALTER FUNCTION "public"."get_user_role_slug"("_user_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."handle_new_user"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -1578,16 +1614,18 @@ DECLARE
   v_username text;
   v_full_name text;
   v_other_count int;
+  v_worker_role_id uuid;
 BEGIN
-  v_username := coalesce(new.raw_user_meta_data->>'username', split_part(new.email,'@',1));
+  v_username := coalesce(new.raw_user_meta_data->>'username', split_part(new.email, '@', 1));
   v_full_name := coalesce(new.raw_user_meta_data->>'full_name', v_username);
+
   INSERT INTO public.profiles (id, username, full_name)
   VALUES (new.id, v_username, v_full_name)
   ON CONFLICT (id) DO NOTHING;
-  INSERT INTO public.user_roles (user_id, role) VALUES (new.id, 'worker')
-  ON CONFLICT DO NOTHING;
-  INSERT INTO public.notification_preferences (user_id)
-  VALUES (new.id)
+
+  SELECT id INTO v_worker_role_id FROM public.app_roles WHERE slug = 'worker' LIMIT 1;
+  INSERT INTO public.user_roles (user_id, role_id)
+  VALUES (new.id, v_worker_role_id)
   ON CONFLICT (user_id) DO NOTHING;
 
   SELECT count(*) INTO v_other_count FROM public.profiles WHERE id <> new.id;
@@ -1597,7 +1635,7 @@ BEGIN
     FROM public.projects p
     WHERE p.archived_at IS NULL
       AND (
-        SELECT count(distinct pa.user_id)
+        SELECT count(DISTINCT pa.user_id)
         FROM public.project_assignments pa
         WHERE pa.project_id = p.id
           AND pa.user_id <> new.id
@@ -1613,15 +1651,63 @@ $$;
 ALTER FUNCTION "public"."handle_new_user"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."has_permission"("_user_id" "uuid", "_key" "text") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT public.is_super_admin(_user_id)
+    OR EXISTS (
+      SELECT 1
+      FROM public.user_roles ur
+      JOIN public.app_role_permissions arp ON arp.role_id = ur.role_id
+      WHERE ur.user_id = _user_id
+        AND arp.permission_key = _key
+    );
+$$;
+
+
+ALTER FUNCTION "public"."has_permission"("_user_id" "uuid", "_key" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."has_role"("_user_id" "uuid", "_role" "public"."app_role") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  select exists (
-    select 1 from public.user_roles
-    where user_id = _user_id
-      and (role = _role or (role = 'super_admin' and _role = 'admin'))
-  )
+  SELECT CASE _role::text
+    WHEN 'super_admin' THEN public.is_super_admin(_user_id)
+    WHEN 'admin' THEN
+      public.is_super_admin(_user_id)
+      OR public.has_permission(_user_id, 'admin.access')
+    WHEN 'manager' THEN
+      public.has_permission(_user_id, 'review.approve_scoped')
+      AND NOT (
+        public.is_super_admin(_user_id)
+        OR public.has_permission(_user_id, 'admin.access')
+      )
+    WHEN 'cjb_manager' THEN
+      (
+        public.has_permission(_user_id, 'staff.read_only')
+        OR (
+          public.has_permission(_user_id, 'staff.read')
+          AND public.has_permission(_user_id, 'review.access')
+          AND NOT public.has_permission(_user_id, 'review.approve_scoped')
+          AND NOT public.has_permission(_user_id, 'review.approve_all')
+          AND NOT public.has_permission(_user_id, 'admin.access')
+        )
+      )
+      AND NOT public.is_super_admin(_user_id)
+    WHEN 'worker' THEN
+      public.has_permission(_user_id, 'forms.submit_own')
+      AND NOT public.is_super_admin(_user_id)
+      AND NOT public.has_permission(_user_id, 'admin.access')
+      AND NOT public.has_permission(_user_id, 'review.approve_scoped')
+      AND NOT public.has_permission(_user_id, 'review.approve_all')
+      AND NOT (
+        public.has_permission(_user_id, 'staff.read')
+        AND public.has_permission(_user_id, 'review.access')
+      )
+    ELSE false
+  END;
 $$;
 
 
@@ -1967,11 +2053,8 @@ CREATE OR REPLACE FUNCTION "public"."is_staff"("_user_id" "uuid") RETURNS boolea
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  SELECT EXISTS (
-    SELECT 1 FROM public.user_roles
-    WHERE user_id = _user_id
-      AND role IN ('manager','admin','cjb_manager','super_admin')
-  )
+  SELECT public.is_super_admin(_user_id)
+    OR public.has_permission(_user_id, 'staff.read');
 $$;
 
 
@@ -2002,6 +2085,23 @@ $$;
 
 
 ALTER FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."is_super_admin"("_user_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.user_roles ur
+    JOIN public.app_roles ar ON ar.id = ur.role_id
+    WHERE ur.user_id = _user_id
+      AND ar.is_super_admin
+  );
+$$;
+
+
+ALTER FUNCTION "public"."is_super_admin"("_user_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."list_cost_duplicate_id_sets"() RETURNS TABLE("dup_ids" "uuid"[], "original_ids" "uuid"[])
@@ -2822,6 +2922,20 @@ $$;
 
 
 ALTER FUNCTION "public"."match_subcontractor_by_company"("p_company" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."migration_export_auth_users"() RETURNS "jsonb"
+    LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'auth', 'public'
+    AS $$
+  SELECT jsonb_build_object(
+    'users', COALESCE((SELECT jsonb_agg(row_to_json(u)) FROM auth.users u), '[]'::jsonb),
+    'identities', COALESCE((SELECT jsonb_agg(row_to_json(i)) FROM auth.identities i), '[]'::jsonb)
+  );
+$$;
+
+
+ALTER FUNCTION "public"."migration_export_auth_users"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."most_common_cost_company_name"("p_match_key" "text") RETURNS "text"
@@ -3861,6 +3975,41 @@ $$;
 ALTER FUNCTION "public"."user_subcontractor"("_user_id" "uuid") OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."app_permissions" (
+    "key" "text" NOT NULL,
+    "label" "text" NOT NULL,
+    "description" "text" DEFAULT ''::"text" NOT NULL,
+    "category" "text" NOT NULL,
+    "super_admin_only" boolean DEFAULT false NOT NULL
+);
+
+
+ALTER TABLE "public"."app_permissions" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."app_role_permissions" (
+    "role_id" "uuid" NOT NULL,
+    "permission_key" "text" NOT NULL
+);
+
+
+ALTER TABLE "public"."app_role_permissions" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."app_roles" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "slug" "text" NOT NULL,
+    "name" "text" NOT NULL,
+    "description" "text" DEFAULT ''::"text" NOT NULL,
+    "is_system" boolean DEFAULT false NOT NULL,
+    "is_super_admin" boolean DEFAULT false NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."app_roles" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."app_settings" (
     "key" "text" NOT NULL,
     "value" "text" NOT NULL,
@@ -4752,7 +4901,7 @@ ALTER TABLE "public"."user_notifications" OWNER TO "postgres";
 CREATE TABLE IF NOT EXISTS "public"."user_roles" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "user_id" "uuid" NOT NULL,
-    "role" "public"."app_role" NOT NULL
+    "role_id" "uuid" NOT NULL
 );
 
 
@@ -4848,6 +4997,26 @@ ALTER TABLE "public"."website_contact_email_account" OWNER TO "postgres";
 
 
 ALTER TABLE ONLY "public"."cost_scan_state" ALTER COLUMN "id" SET DEFAULT "nextval"('"public"."cost_scan_state_id_seq"'::"regclass");
+
+
+
+ALTER TABLE ONLY "public"."app_permissions"
+    ADD CONSTRAINT "app_permissions_pkey" PRIMARY KEY ("key");
+
+
+
+ALTER TABLE ONLY "public"."app_role_permissions"
+    ADD CONSTRAINT "app_role_permissions_pkey" PRIMARY KEY ("role_id", "permission_key");
+
+
+
+ALTER TABLE ONLY "public"."app_roles"
+    ADD CONSTRAINT "app_roles_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."app_roles"
+    ADD CONSTRAINT "app_roles_slug_key" UNIQUE ("slug");
 
 
 
@@ -5212,11 +5381,6 @@ ALTER TABLE ONLY "public"."user_roles"
 
 
 ALTER TABLE ONLY "public"."user_roles"
-    ADD CONSTRAINT "user_roles_user_id_role_key" UNIQUE ("user_id", "role");
-
-
-
-ALTER TABLE ONLY "public"."user_roles"
     ADD CONSTRAINT "user_roles_user_id_unique" UNIQUE ("user_id");
 
 
@@ -5253,6 +5417,10 @@ ALTER TABLE ONLY "public"."vehicles"
 
 ALTER TABLE ONLY "public"."website_contact_email_account"
     ADD CONSTRAINT "website_contact_email_account_pkey" PRIMARY KEY ("id");
+
+
+
+CREATE INDEX "app_role_permissions_permission_key_idx" ON "public"."app_role_permissions" USING "btree" ("permission_key");
 
 
 
@@ -5708,6 +5876,16 @@ CREATE OR REPLACE TRIGGER "update_cost_dated_scans_updated_at" BEFORE UPDATE ON 
 
 
 
+ALTER TABLE ONLY "public"."app_role_permissions"
+    ADD CONSTRAINT "app_role_permissions_permission_key_fkey" FOREIGN KEY ("permission_key") REFERENCES "public"."app_permissions"("key") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."app_role_permissions"
+    ADD CONSTRAINT "app_role_permissions_role_id_fkey" FOREIGN KEY ("role_id") REFERENCES "public"."app_roles"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."cost_company_subcontractors"
     ADD CONSTRAINT "cost_company_subcontractors_subcontractor_id_fkey" FOREIGN KEY ("subcontractor_id") REFERENCES "public"."subcontractors"("id") ON DELETE CASCADE;
 
@@ -6099,6 +6277,11 @@ ALTER TABLE ONLY "public"."user_notifications"
 
 
 ALTER TABLE ONLY "public"."user_roles"
+    ADD CONSTRAINT "user_roles_role_id_fkey" FOREIGN KEY ("role_id") REFERENCES "public"."app_roles"("id");
+
+
+
+ALTER TABLE ONLY "public"."user_roles"
     ADD CONSTRAINT "user_roles_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
@@ -6191,6 +6374,18 @@ CREATE POLICY "Admins manage cost_suppliers" ON "public"."cost_suppliers" TO "au
 
 
 
+CREATE POLICY "Admins read app_permissions" ON "public"."app_permissions" FOR SELECT TO "authenticated" USING (("public"."has_permission"("auth"."uid"(), 'admin.roles.manage'::"text") OR "public"."is_super_admin"("auth"."uid"())));
+
+
+
+CREATE POLICY "Admins read app_role_permissions" ON "public"."app_role_permissions" FOR SELECT TO "authenticated" USING (("public"."has_permission"("auth"."uid"(), 'admin.roles.manage'::"text") OR "public"."is_super_admin"("auth"."uid"())));
+
+
+
+CREATE POLICY "Admins read app_roles" ON "public"."app_roles" FOR SELECT TO "authenticated" USING (("public"."has_permission"("auth"."uid"(), 'admin.roles.manage'::"text") OR "public"."is_super_admin"("auth"."uid"())));
+
+
+
 CREATE POLICY "Admins read cost invoices" ON "public"."cost_invoices" FOR SELECT TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
 
 
@@ -6231,6 +6426,10 @@ CREATE POLICY "Authenticated read app settings" ON "public"."app_settings" FOR S
 
 
 
+CREATE POLICY "Authenticated read app_roles metadata" ON "public"."app_roles" FOR SELECT TO "authenticated" USING (true);
+
+
+
 CREATE POLICY "Insert holidays for self or managed worker" ON "public"."holidays" FOR INSERT TO "authenticated" WITH CHECK ((("user_id" = "auth"."uid"()) OR "public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("user_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id")))));
 
 
@@ -6257,6 +6456,15 @@ CREATE POLICY "Staff oversight view holidays" ON "public"."holidays" FOR SELECT 
 
 CREATE POLICY "Users view own holidays" ON "public"."holidays" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
 
+
+
+ALTER TABLE "public"."app_permissions" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."app_role_permissions" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."app_roles" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."app_settings" ENABLE ROW LEVEL SECURITY;
@@ -7527,8 +7735,26 @@ GRANT ALL ON FUNCTION "public"."get_integration_secret"("p_name" "text") TO "ser
 
 
 
+REVOKE ALL ON FUNCTION "public"."get_user_permissions"("_user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_user_permissions"("_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_user_permissions"("_user_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."get_user_role_slug"("_user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_user_role_slug"("_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_user_role_slug"("_user_id" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."handle_new_user"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."handle_new_user"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."has_permission"("_user_id" "uuid", "_key" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."has_permission"("_user_id" "uuid", "_key" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."has_permission"("_user_id" "uuid", "_key" "text") TO "service_role";
 
 
 
@@ -7634,6 +7860,12 @@ GRANT ALL ON FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") TO "se
 
 
 
+REVOKE ALL ON FUNCTION "public"."is_super_admin"("_user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_super_admin"("_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_super_admin"("_user_id" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."list_cost_duplicate_id_sets"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."list_cost_duplicate_id_sets"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."list_cost_duplicate_id_sets"() TO "service_role";
@@ -7693,6 +7925,13 @@ GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "te
 
 REVOKE ALL ON FUNCTION "public"."match_subcontractor_by_company"("p_company" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."match_subcontractor_by_company"("p_company" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."migration_export_auth_users"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."migration_export_auth_users"() TO "anon";
+GRANT ALL ON FUNCTION "public"."migration_export_auth_users"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."migration_export_auth_users"() TO "service_role";
 
 
 
@@ -7917,6 +8156,24 @@ GRANT ALL ON FUNCTION "public"."user_subcontractor"("_user_id" "uuid") TO "servi
 
 
 
+
+
+
+GRANT ALL ON TABLE "public"."app_permissions" TO "anon";
+GRANT ALL ON TABLE "public"."app_permissions" TO "authenticated";
+GRANT ALL ON TABLE "public"."app_permissions" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."app_role_permissions" TO "anon";
+GRANT ALL ON TABLE "public"."app_role_permissions" TO "authenticated";
+GRANT ALL ON TABLE "public"."app_role_permissions" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."app_roles" TO "anon";
+GRANT ALL ON TABLE "public"."app_roles" TO "authenticated";
+GRANT ALL ON TABLE "public"."app_roles" TO "service_role";
 
 
 

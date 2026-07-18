@@ -4,7 +4,7 @@ SET session_replication_role = replica;
 -- PostgreSQL database dump
 --
 
--- \restrict zG76L69sK94VLaPSIJ1AImSkNfHYnfpMMz9tf3bQmXa9G4nzemgV4OjrHSgMBFJ
+-- \restrict jMtcMDzmiZVA8PUaNfCqzPiiS9uEtpXgEz7Y1O1lMsprMgSZOAW9tWjgQyNWyKn
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.6
@@ -94,10 +94,10 @@ COPY "auth"."users" ("instance_id", "id", "aud", "role", "email", "encrypted_pas
 00000000-0000-0000-0000-000000000000	f64b5eee-d09e-4b3f-bd65-9f9a940927ad	authenticated	authenticated	oleksandrokishor@cjb.local	$2a$10$YJSCYtv4S1ZGv9x8yPA8jOkB26RKukM3/VYLU7JyTLwIXSSCBxclu	2026-06-17 16:34:28.524644+00	\N		\N		\N			\N	\N	{"provider": "email", "providers": ["email"]}	{"username": "oleksandrokishor", "full_name": "Oleksandr Okishor", "email_verified": true}	\N	2026-06-17 16:34:28.494283+00	2026-06-17 16:34:28.52692+00	\N	\N			\N		0	\N		\N	f	\N	f
 00000000-0000-0000-0000-000000000000	a8f2b105-eea2-4fb1-9570-8c48381481c9	authenticated	authenticated	simioncocarca@cjb.local	$2a$10$hdcJeKlRFXoV.dq/kh0a6u14myyU5L14TYOmi/7R7uGgvtxhtmKoK	2026-06-17 16:35:45.807191+00	\N		\N		\N			\N	\N	{"provider": "email", "providers": ["email"]}	{"username": "simioncocarca", "full_name": "Simion Cocarca", "email_verified": true}	\N	2026-06-17 16:35:45.79518+00	2026-06-17 16:35:45.808127+00	\N	\N			\N		0	\N		\N	f	\N	f
 00000000-0000-0000-0000-000000000000	c78c1158-49da-4c16-96cb-e0b58d8d61a7	authenticated	authenticated	mykytavolkov@cjb.local	$2a$10$ZAfqb0rR0vWGJSpbtARFseJqO/rNxqYlc2twipV19BROFEFDRbc8m	2026-06-17 16:36:33.276972+00	\N		\N		\N			\N	\N	{"provider": "email", "providers": ["email"]}	{"username": "mykytavolkov", "full_name": "Mykyta Volkov", "email_verified": true}	\N	2026-06-17 16:36:33.274066+00	2026-06-17 16:36:33.277839+00	\N	\N			\N		0	\N		\N	f	\N	f
-00000000-0000-0000-0000-000000000000	88d0f86d-f232-418b-a4de-65b94e037da6	authenticated	authenticated	testworker@cjb.local	$2a$10$PM9gBrDFkJiqLfhMNX443una0mRbiDPb2tuf/jBJsRA.Fa9Q95K6e	2026-07-03 19:11:46.801461+00	\N		\N		\N			\N	2026-07-09 07:15:04.422387+00	{"provider": "email", "providers": ["email"]}	{"username": "testworker", "full_name": "Testworker", "email_verified": true}	\N	2026-07-03 19:11:46.670183+00	2026-07-09 07:15:04.490801+00	\N	\N			\N		0	\N		\N	f	\N	f
 00000000-0000-0000-0000-000000000000	713f38a4-7b2c-42b0-8df4-424d54ef5d0f	authenticated	authenticated	kylenaddy@cjb.local	$2a$10$6dLYxh.PtTHjMqXhjHPzbOACavMyMPCagBZ9sztsr7a/JOj1Xi7cm	2026-06-10 19:45:42.55578+00	\N		\N		\N			\N	2026-07-07 13:58:04.219703+00	{"provider": "email", "providers": ["email"]}	{"username": "kylenaddy", "full_name": "Kyle Naddy", "email_verified": true}	\N	2026-06-10 19:45:42.52614+00	2026-07-10 15:40:25.826864+00	\N	\N			\N		0	\N		\N	f	\N	f
 00000000-0000-0000-0000-000000000000	f7433041-0a01-4d8c-a883-46a0f3c92152	authenticated	authenticated	eugendib@cjb.local	$2a$10$Yexo84QKmkVti/3p7sF53eRT4l9N4M1AtV411X4kpdaNeifzf0H0S	2026-06-16 07:42:42.856224+00	\N		\N		\N			\N	2026-06-22 14:50:10.944467+00	{"provider": "email", "providers": ["email"]}	{"username": "eugendib", "full_name": "Eugen Dib", "email_verified": true}	\N	2026-06-16 07:42:42.853028+00	2026-07-10 14:14:36.282418+00	\N	\N			\N		0	\N		\N	f	\N	f
 00000000-0000-0000-0000-000000000000	66a9dc9f-5b19-4f79-9eb5-1d7cdb49ef82	authenticated	authenticated	constantincostea@cjb.local	$2a$10$T8tz3OmzwyHtNJHf.Zgum.9MNm2Gk3G0URsuKe5rQpnAl8y0HJQDi	2026-06-16 07:35:08.400171+00	\N		\N		\N			\N	2026-07-03 07:49:16.64538+00	{"provider": "email", "providers": ["email"]}	{"username": "constantincostea", "full_name": "Constantin Costea", "email_verified": true}	\N	2026-06-16 07:35:08.375898+00	2026-07-10 07:51:32.949032+00	\N	\N			\N		0	\N		\N	f	\N	f
+00000000-0000-0000-0000-000000000000	88d0f86d-f232-418b-a4de-65b94e037da6	authenticated	authenticated	testworker@cjb.local	$2a$06$aCFfXLqNok4svi36M0M6Vec8nq0RhT4o3QSaJn79sj5PsNgqXaJGa	2026-07-03 19:11:46.801461+00	\N		\N		\N			\N	2026-07-09 07:15:04.422387+00	{"provider": "email", "providers": ["email"]}	{"username": "testworker", "full_name": "Testworker", "email_verified": true}	\N	2026-07-03 19:11:46.670183+00	2026-07-09 07:15:04.490801+00	\N	\N			\N		0	\N		\N	f	\N	f
 00000000-0000-0000-0000-000000000000	5d2b0a94-cb50-433e-b654-525045548590	authenticated	authenticated	ionutpetre@cjb.local	$2a$10$f/u56yjW/Hd0EujVr5BDb.KIoQy0iqHifOU.5t/MDYv8jUUs6SoPC	2026-06-16 07:40:06.426194+00	\N		\N		\N			\N	2026-06-23 15:34:44.178529+00	{"provider": "email", "providers": ["email"]}	{"username": "ionutpetre", "full_name": "Ionut Petre", "email_verified": true}	\N	2026-06-16 07:40:06.417307+00	2026-07-04 11:42:20.704442+00	\N	\N			\N		0	\N		\N	f	\N	f
 00000000-0000-0000-0000-000000000000	55fe5d03-5dde-4508-9f57-6a1db5db779b	authenticated	authenticated	gheorghemihalcea@cjb.local	$2a$10$wBEsLqH35Rv8OIGDKVhFnuvB8mCcD4D1/dL.62z0Su940VW.02vam	2026-06-13 01:25:57.579295+00	\N		\N		\N			\N	2026-06-29 07:08:26.569756+00	{"provider": "email", "providers": ["email"]}	{"username": "gheorghemihalcea", "full_name": "Gheorghe Mihalcea", "email_verified": true}	\N	2026-06-13 01:25:57.571714+00	2026-07-06 05:38:37.709829+00	\N	\N			\N		0	\N		\N	f	\N	f
 00000000-0000-0000-0000-000000000000	62d60f6c-fafd-4b66-b48e-472bfa39d0cd	authenticated	authenticated	grigoritascrivat@cjb.local	$2a$10$fIp7lDzk3gSHeFAIHINX3uEKeGvRUR0rX0.wklj3HOQdU7uxhqRUm	2026-06-13 01:25:05.360801+00	\N		\N		\N			\N	2026-06-22 07:11:17.206634+00	{"provider": "email", "providers": ["email"]}	{"username": "grigoritascrivat", "full_name": "Grigorita Scrivat", "email_verified": true}	\N	2026-06-13 01:25:05.357378+00	2026-07-06 06:26:28.43336+00	\N	\N			\N		0	\N		\N	f	\N	f
@@ -1281,6 +1281,118 @@ COPY "auth"."webauthn_challenges" ("id", "user_id", "challenge_type", "session_d
 --
 
 COPY "auth"."webauthn_credentials" ("id", "user_id", "credential_id", "public_key", "attestation_type", "aaguid", "sign_count", "transports", "backup_eligible", "backed_up", "friendly_name", "created_at", "updated_at", "last_used_at") FROM stdin;
+\.
+
+
+--
+-- Data for Name: app_permissions; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY "public"."app_permissions" ("key", "label", "description", "category", "super_admin_only") FROM stdin;
+forms.submit_own	Submit own forms	Submit timesheets, HAVS logs, and other personal forms.	Forms	f
+forms.submit_on_behalf	Submit on behalf of others	Submit forms for other users.	Forms	f
+staff.read	Staff read access	View submissions and data for staff oversight.	Review	f
+staff.read_only	Read-only staff oversight	CJB-style read access without approval powers.	Review	f
+review.access	Review queue	Access the review page and pending submissions.	Review	f
+review.approve_scoped	Approve (subcontractor scope)	Approve submissions within the user's subcontractor group.	Review	f
+review.approve_all	Approve (all users)	Approve submissions for any user.	Review	f
+dashboard.access	Dashboard	Access the admin dashboard.	Navigation	f
+team.access	Team	Access the team page.	Navigation	f
+tracking.access	Tracking	Access the tracking page.	Navigation	f
+admin.access	Admin panel	Access the admin panel.	Admin	f
+admin.users.manage	Manage users	Create, edit, and disable user accounts.	Admin	f
+admin.roles.manage	Manage roles	Create roles and edit permission assignments.	Admin	f
+admin.lookups.manage	Manage lookups	Edit clients, subcontractors, projects, and other reference data.	Admin	f
+admin.invoices	Invoices	Access invoice management.	Admin	f
+admin.reminders	Submission reminders	Configure system-wide submission reminders.	Admin	f
+costs.view	View costs	Access the costs page.	Costs	f
+costs.manage	Manage costs	Edit costs, suppliers, and related settings.	Costs	f
+financials.view	View financials	See pay rates, wage spend, and other financial figures.	Costs	f
+todo.create	Create todo lists	Create new todo lists.	Todo	f
+todo.manage	Manage todo lists	Archive, delete, and configure todo lists.	Todo	f
+platform.website	Website CMS	Edit the public website.	Platform	t
+platform.integrations	Email & storage integrations	Configure email accounts and storage backends.	Platform	t
+platform.secrets	Platform secrets	Manage app secrets, branding, and company settings.	Platform	t
+\.
+
+
+--
+-- Data for Name: app_roles; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY "public"."app_roles" ("id", "slug", "name", "description", "is_system", "is_super_admin", "created_at") FROM stdin;
+00000000-0000-4000-8000-000000000001	worker	Worker	Default role for field workers.	t	f	2026-07-18 15:13:08.25288+00
+00000000-0000-4000-8000-000000000002	manager	Manager	Subcontractor-scoped manager with approval powers.	t	f	2026-07-18 15:13:08.25288+00
+00000000-0000-4000-8000-000000000003	admin	Admin	Full operational administrator.	t	f	2026-07-18 15:13:08.25288+00
+00000000-0000-4000-8000-000000000004	cjb_manager	CJB Manager	Read-only oversight role.	t	f	2026-07-18 15:13:08.25288+00
+00000000-0000-4000-8000-000000000005	super_admin	Super Admin	Platform owner with full access.	t	t	2026-07-18 15:13:08.25288+00
+\.
+
+
+--
+-- Data for Name: app_role_permissions; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY "public"."app_role_permissions" ("role_id", "permission_key") FROM stdin;
+00000000-0000-4000-8000-000000000001	forms.submit_own
+00000000-0000-4000-8000-000000000002	forms.submit_own
+00000000-0000-4000-8000-000000000002	forms.submit_on_behalf
+00000000-0000-4000-8000-000000000002	staff.read
+00000000-0000-4000-8000-000000000002	review.access
+00000000-0000-4000-8000-000000000002	review.approve_scoped
+00000000-0000-4000-8000-000000000002	dashboard.access
+00000000-0000-4000-8000-000000000002	team.access
+00000000-0000-4000-8000-000000000002	financials.view
+00000000-0000-4000-8000-000000000002	todo.create
+00000000-0000-4000-8000-000000000003	forms.submit_own
+00000000-0000-4000-8000-000000000003	forms.submit_on_behalf
+00000000-0000-4000-8000-000000000003	staff.read
+00000000-0000-4000-8000-000000000003	review.access
+00000000-0000-4000-8000-000000000003	review.approve_all
+00000000-0000-4000-8000-000000000003	dashboard.access
+00000000-0000-4000-8000-000000000003	team.access
+00000000-0000-4000-8000-000000000003	tracking.access
+00000000-0000-4000-8000-000000000003	admin.access
+00000000-0000-4000-8000-000000000003	admin.users.manage
+00000000-0000-4000-8000-000000000003	admin.roles.manage
+00000000-0000-4000-8000-000000000003	admin.lookups.manage
+00000000-0000-4000-8000-000000000003	admin.invoices
+00000000-0000-4000-8000-000000000003	admin.reminders
+00000000-0000-4000-8000-000000000003	costs.view
+00000000-0000-4000-8000-000000000003	costs.manage
+00000000-0000-4000-8000-000000000003	financials.view
+00000000-0000-4000-8000-000000000003	todo.create
+00000000-0000-4000-8000-000000000003	todo.manage
+00000000-0000-4000-8000-000000000004	forms.submit_own
+00000000-0000-4000-8000-000000000004	staff.read
+00000000-0000-4000-8000-000000000004	staff.read_only
+00000000-0000-4000-8000-000000000004	review.access
+00000000-0000-4000-8000-000000000004	dashboard.access
+00000000-0000-4000-8000-000000000004	todo.create
+00000000-0000-4000-8000-000000000005	forms.submit_own
+00000000-0000-4000-8000-000000000005	forms.submit_on_behalf
+00000000-0000-4000-8000-000000000005	staff.read
+00000000-0000-4000-8000-000000000005	staff.read_only
+00000000-0000-4000-8000-000000000005	review.access
+00000000-0000-4000-8000-000000000005	review.approve_scoped
+00000000-0000-4000-8000-000000000005	review.approve_all
+00000000-0000-4000-8000-000000000005	dashboard.access
+00000000-0000-4000-8000-000000000005	team.access
+00000000-0000-4000-8000-000000000005	tracking.access
+00000000-0000-4000-8000-000000000005	admin.access
+00000000-0000-4000-8000-000000000005	admin.users.manage
+00000000-0000-4000-8000-000000000005	admin.roles.manage
+00000000-0000-4000-8000-000000000005	admin.lookups.manage
+00000000-0000-4000-8000-000000000005	admin.invoices
+00000000-0000-4000-8000-000000000005	admin.reminders
+00000000-0000-4000-8000-000000000005	costs.view
+00000000-0000-4000-8000-000000000005	costs.manage
+00000000-0000-4000-8000-000000000005	financials.view
+00000000-0000-4000-8000-000000000005	todo.create
+00000000-0000-4000-8000-000000000005	todo.manage
+00000000-0000-4000-8000-000000000005	platform.website
+00000000-0000-4000-8000-000000000005	platform.integrations
+00000000-0000-4000-8000-000000000005	platform.secrets
 \.
 
 
@@ -8886,66 +8998,66 @@ cd66714f-0740-4037-a9b4-0700750b7731	473b0582-0fa6-43c3-8f52-ef89bb2810a1	todo_r
 -- Data for Name: user_roles; Type: TABLE DATA; Schema: public; Owner: postgres
 --
 
-COPY "public"."user_roles" ("id", "user_id", "role") FROM stdin;
-34454c43-7dd7-431d-8441-ca61cb41aca9	f7433041-0a01-4d8c-a883-46a0f3c92152	worker
-1e25a279-ff8e-4f32-b9b7-795b477fe0d5	7790c180-e52f-44da-97c0-e190ec9f233f	manager
-8fa18f54-a28c-4959-9c37-6934436a42e3	b673c078-c84b-48c8-845d-6aeceb94b19a	worker
-57b06f20-b99d-4e9f-93cc-78ef9cdd9a12	fe0832db-4ea7-4c23-8cae-9a96d0e70a8c	admin
-866a3448-fdb8-444b-a8e3-4b994da4eb1c	82cbc827-4809-495a-bd14-9f02bb6d03f9	manager
-15d8ffcf-7601-499c-acda-cece1c5be266	7e790d8a-20b5-4a45-93b0-291987eff0f1	manager
-743afcf2-46f7-4079-839b-387bbf024c6f	473b0582-0fa6-43c3-8f52-ef89bb2810a1	admin
-fabd888a-a858-4db2-8693-f086cedd6f51	97ed2ada-c2be-4dba-81c1-dc23e9d43ddf	cjb_manager
-2913d718-3029-4c95-8418-6152c8bd6f57	f64b5eee-d09e-4b3f-bd65-9f9a940927ad	worker
-96dc22a8-020e-4d32-ae69-1884354bcdda	4c9cc9ec-d7c3-4a51-a4d9-5fa75d804e24	cjb_manager
-04ace7ec-675b-4374-91eb-8b0c8cb45c88	e8371995-63a7-43de-a944-87ea9859edbd	worker
-366fc29b-c199-4346-b035-ec5cffb6d787	a8f2b105-eea2-4fb1-9570-8c48381481c9	worker
-ed2f72ca-753d-4c08-9241-466f7bd74b92	c78c1158-49da-4c16-96cb-e0b58d8d61a7	worker
-21e26dac-9ce6-44dd-a956-5d94235d1136	c45e2b3b-858e-4cc9-b893-606be19db21e	manager
-3a1c0a7d-6d1f-4f96-9d90-455aecf9a2fb	feddbb7c-71f0-4ec5-916c-4a2cdaa517a2	worker
-d946c977-f9f7-4f86-b7cd-e1a80b4ac058	bba10388-e3a5-4e70-a6d7-123fb3f656e5	worker
-929645cc-a70f-436d-a9cc-d50f5f2c5d80	fae5424f-167a-4ad9-ba55-189b684e569b	worker
-2403fb10-4a4f-4643-91e8-8920a4a7a64a	de005c4b-55c6-49b8-bb8a-3e546e67b52d	worker
-62b55b1b-352a-4949-8856-f0f868b1ca61	4532cd1f-2752-4aa9-a304-8a66a6fb9875	worker
-708f0d19-69a0-4309-859e-574390eed916	fab0cd1f-129b-4cf8-be1c-22667db1930c	worker
-7af3066f-a16a-49d2-8bdc-61d69feaedf7	7aad6855-2a47-416a-a13e-f7800ca87940	worker
-0ee1023a-c1ee-444f-8686-471dfacfcec3	d5b9af57-9326-4f03-8595-e1860836a8a5	worker
-a2e6b793-2555-4fc6-b2ca-eeb96d7d4378	a1161bd5-de49-4bb4-8f13-2477365a4309	worker
-499a06f9-7907-42e5-86cf-1d8abdadf7ad	85145bb3-01b9-4511-9a5b-a34f9b50c9cf	worker
-e3787df0-22a7-47a5-9113-2bb85cbcd6a3	04a6baa7-cc7f-4c06-84ff-fec3e055b9a3	worker
-a08d8a41-3990-4ff8-92f1-7ab864b90590	3375295b-b3a3-40af-9cb5-81959e07fa23	worker
-f1e7140d-36ce-4a2e-a6a2-70abeb941021	c1b79407-8801-4583-8b57-7a5256333600	worker
-eed64923-ef98-4e1c-ac8c-2a647a2d8b24	1d46ac0e-4581-444e-9a38-caac78d30d53	worker
-4da647ae-ba72-4039-9030-cc8d89c6da71	a46f113c-b5c3-4309-a2e1-b20a173d0d20	worker
-7d671450-9ec9-4f7b-9888-66e947747d3a	3932d151-3fc9-4539-ae2c-31032ec99202	worker
-fc765a9e-1244-4bb9-b3df-9f946db64185	62d60f6c-fafd-4b66-b48e-472bfa39d0cd	worker
-d7c61a44-8f85-4032-b93e-bc2e1e72d645	49952daf-c3ea-4cb6-a4e6-87a1199a6d89	worker
-0b2aa151-f02c-480a-814d-1701c51859fc	55fe5d03-5dde-4508-9f57-6a1db5db779b	worker
-4483a039-5630-4b2d-982e-bc73f5f80ef9	f5adc8bf-b6df-4d42-989a-ffe879b73b87	worker
-4cfaf352-59a3-4f47-a121-c981dd9bac70	3e73d6f4-44e6-4f1e-8f96-e2b2cacb1141	worker
-2d4a4ef1-0bc6-4570-834f-c4a8736a994c	efaf85bf-1e4c-4933-b062-1110a5181f16	worker
-e77d35d1-227b-4a1a-8884-3d90a6fafa7f	87c10d8e-e4b4-4871-a0bf-2d454e855fb2	manager
-4e9a5485-b054-47b3-9611-ac76b24d607b	39e2ad12-c499-4e7a-b1f4-914506da8514	worker
-54f36359-2cde-42b6-9484-669846c77b10	a8aeff32-1421-43a7-8da5-a66278adba47	worker
-4c7a7199-3eae-4f1b-85c8-2540c6f5854d	424451a7-7620-470a-a700-88ec2b14b64f	worker
-1e1d41cf-7daa-4c4d-b333-0d2359ad0c7e	52afddec-3cae-42ce-9092-8440e1fa8014	worker
-a25f8c26-ed95-4a4d-b645-44f520c85dd4	66a9dc9f-5b19-4f79-9eb5-1d7cdb49ef82	manager
-0db2c4f3-a216-4fb7-9bc0-b628c542079d	5af69b55-ef40-4fc8-8430-71f1a19f8f75	worker
-01fdb5e8-4c02-4b28-9004-e05484a86285	a5c46085-e9c5-4c24-ad52-3aaf0eb75ced	worker
-de0af4f5-2628-49a1-a22a-089eea398825	9d2863fc-0252-4cfe-be88-d19047ffa885	worker
-aac4cd40-4e8e-4af0-ae19-f321b6965204	2968342a-95a1-46e5-a23c-c392fce4f451	worker
-8e1c46e9-f41c-4c8f-ab66-6b056b04ab9d	19791a1c-fe79-4c25-9175-506bde74134f	worker
-f9036c1b-65b0-4580-883b-84da2e370d2a	5d2b0a94-cb50-433e-b654-525045548590	worker
-f9569b96-fd7b-400b-a088-6d41c0c1df9f	044214c4-2c02-4f1c-a8e8-edcb23b9cb62	worker
-fd6ecd50-0300-4073-a2eb-fe3e82900e18	e4108e51-f590-4296-82a4-be5627bb187f	worker
-be26ec51-5591-459f-b979-b11e4cd5355e	e40c047f-b7e9-4f41-b20a-209baed651ac	worker
-494997e2-8b71-4e01-bda2-cb382a4612d6	0249ef1d-3838-47cb-b070-17304161723e	worker
-33aab1f7-b5a9-4ad3-9569-b3276d116092	299f2320-8499-413f-b2a6-c1ef3452b698	worker
-35592894-aff4-408f-9324-82de30c6cdc4	1dd0dd8f-a315-4763-9040-59040cacbc6c	worker
-66cad1be-c9c3-436c-8454-22fbd2a07037	2c008c6d-9a0f-4654-bda5-a1cabbdcce73	worker
-57541868-04f0-4e10-8bed-9924ea3a0a4f	713f38a4-7b2c-42b0-8df4-424d54ef5d0f	super_admin
-013c2de6-ece2-4d1d-8852-e4d57b9b4594	88d0f86d-f232-418b-a4de-65b94e037da6	worker
-c49d3d91-5fbf-4726-b883-fb1b8aa0bbe2	37b93606-3e9f-4b43-a953-dad7985e39c4	cjb_manager
-e6104cb6-cd3b-4450-90b8-27e877463646	85754a1b-816f-4575-906e-5139f3587788	manager
+COPY "public"."user_roles" ("id", "user_id", "role_id") FROM stdin;
+34454c43-7dd7-431d-8441-ca61cb41aca9	f7433041-0a01-4d8c-a883-46a0f3c92152	00000000-0000-4000-8000-000000000001
+1e25a279-ff8e-4f32-b9b7-795b477fe0d5	7790c180-e52f-44da-97c0-e190ec9f233f	00000000-0000-4000-8000-000000000002
+8fa18f54-a28c-4959-9c37-6934436a42e3	b673c078-c84b-48c8-845d-6aeceb94b19a	00000000-0000-4000-8000-000000000001
+57b06f20-b99d-4e9f-93cc-78ef9cdd9a12	fe0832db-4ea7-4c23-8cae-9a96d0e70a8c	00000000-0000-4000-8000-000000000003
+866a3448-fdb8-444b-a8e3-4b994da4eb1c	82cbc827-4809-495a-bd14-9f02bb6d03f9	00000000-0000-4000-8000-000000000002
+15d8ffcf-7601-499c-acda-cece1c5be266	7e790d8a-20b5-4a45-93b0-291987eff0f1	00000000-0000-4000-8000-000000000002
+743afcf2-46f7-4079-839b-387bbf024c6f	473b0582-0fa6-43c3-8f52-ef89bb2810a1	00000000-0000-4000-8000-000000000003
+fabd888a-a858-4db2-8693-f086cedd6f51	97ed2ada-c2be-4dba-81c1-dc23e9d43ddf	00000000-0000-4000-8000-000000000004
+2913d718-3029-4c95-8418-6152c8bd6f57	f64b5eee-d09e-4b3f-bd65-9f9a940927ad	00000000-0000-4000-8000-000000000001
+96dc22a8-020e-4d32-ae69-1884354bcdda	4c9cc9ec-d7c3-4a51-a4d9-5fa75d804e24	00000000-0000-4000-8000-000000000004
+04ace7ec-675b-4374-91eb-8b0c8cb45c88	e8371995-63a7-43de-a944-87ea9859edbd	00000000-0000-4000-8000-000000000001
+366fc29b-c199-4346-b035-ec5cffb6d787	a8f2b105-eea2-4fb1-9570-8c48381481c9	00000000-0000-4000-8000-000000000001
+ed2f72ca-753d-4c08-9241-466f7bd74b92	c78c1158-49da-4c16-96cb-e0b58d8d61a7	00000000-0000-4000-8000-000000000001
+21e26dac-9ce6-44dd-a956-5d94235d1136	c45e2b3b-858e-4cc9-b893-606be19db21e	00000000-0000-4000-8000-000000000002
+3a1c0a7d-6d1f-4f96-9d90-455aecf9a2fb	feddbb7c-71f0-4ec5-916c-4a2cdaa517a2	00000000-0000-4000-8000-000000000001
+d946c977-f9f7-4f86-b7cd-e1a80b4ac058	bba10388-e3a5-4e70-a6d7-123fb3f656e5	00000000-0000-4000-8000-000000000001
+929645cc-a70f-436d-a9cc-d50f5f2c5d80	fae5424f-167a-4ad9-ba55-189b684e569b	00000000-0000-4000-8000-000000000001
+2403fb10-4a4f-4643-91e8-8920a4a7a64a	de005c4b-55c6-49b8-bb8a-3e546e67b52d	00000000-0000-4000-8000-000000000001
+62b55b1b-352a-4949-8856-f0f868b1ca61	4532cd1f-2752-4aa9-a304-8a66a6fb9875	00000000-0000-4000-8000-000000000001
+708f0d19-69a0-4309-859e-574390eed916	fab0cd1f-129b-4cf8-be1c-22667db1930c	00000000-0000-4000-8000-000000000001
+7af3066f-a16a-49d2-8bdc-61d69feaedf7	7aad6855-2a47-416a-a13e-f7800ca87940	00000000-0000-4000-8000-000000000001
+0ee1023a-c1ee-444f-8686-471dfacfcec3	d5b9af57-9326-4f03-8595-e1860836a8a5	00000000-0000-4000-8000-000000000001
+a2e6b793-2555-4fc6-b2ca-eeb96d7d4378	a1161bd5-de49-4bb4-8f13-2477365a4309	00000000-0000-4000-8000-000000000001
+499a06f9-7907-42e5-86cf-1d8abdadf7ad	85145bb3-01b9-4511-9a5b-a34f9b50c9cf	00000000-0000-4000-8000-000000000001
+e3787df0-22a7-47a5-9113-2bb85cbcd6a3	04a6baa7-cc7f-4c06-84ff-fec3e055b9a3	00000000-0000-4000-8000-000000000001
+a08d8a41-3990-4ff8-92f1-7ab864b90590	3375295b-b3a3-40af-9cb5-81959e07fa23	00000000-0000-4000-8000-000000000001
+f1e7140d-36ce-4a2e-a6a2-70abeb941021	c1b79407-8801-4583-8b57-7a5256333600	00000000-0000-4000-8000-000000000001
+eed64923-ef98-4e1c-ac8c-2a647a2d8b24	1d46ac0e-4581-444e-9a38-caac78d30d53	00000000-0000-4000-8000-000000000001
+4da647ae-ba72-4039-9030-cc8d89c6da71	a46f113c-b5c3-4309-a2e1-b20a173d0d20	00000000-0000-4000-8000-000000000001
+7d671450-9ec9-4f7b-9888-66e947747d3a	3932d151-3fc9-4539-ae2c-31032ec99202	00000000-0000-4000-8000-000000000001
+fc765a9e-1244-4bb9-b3df-9f946db64185	62d60f6c-fafd-4b66-b48e-472bfa39d0cd	00000000-0000-4000-8000-000000000001
+d7c61a44-8f85-4032-b93e-bc2e1e72d645	49952daf-c3ea-4cb6-a4e6-87a1199a6d89	00000000-0000-4000-8000-000000000001
+0b2aa151-f02c-480a-814d-1701c51859fc	55fe5d03-5dde-4508-9f57-6a1db5db779b	00000000-0000-4000-8000-000000000001
+4483a039-5630-4b2d-982e-bc73f5f80ef9	f5adc8bf-b6df-4d42-989a-ffe879b73b87	00000000-0000-4000-8000-000000000001
+4cfaf352-59a3-4f47-a121-c981dd9bac70	3e73d6f4-44e6-4f1e-8f96-e2b2cacb1141	00000000-0000-4000-8000-000000000001
+2d4a4ef1-0bc6-4570-834f-c4a8736a994c	efaf85bf-1e4c-4933-b062-1110a5181f16	00000000-0000-4000-8000-000000000001
+e77d35d1-227b-4a1a-8884-3d90a6fafa7f	87c10d8e-e4b4-4871-a0bf-2d454e855fb2	00000000-0000-4000-8000-000000000002
+4e9a5485-b054-47b3-9611-ac76b24d607b	39e2ad12-c499-4e7a-b1f4-914506da8514	00000000-0000-4000-8000-000000000001
+54f36359-2cde-42b6-9484-669846c77b10	a8aeff32-1421-43a7-8da5-a66278adba47	00000000-0000-4000-8000-000000000001
+4c7a7199-3eae-4f1b-85c8-2540c6f5854d	424451a7-7620-470a-a700-88ec2b14b64f	00000000-0000-4000-8000-000000000001
+1e1d41cf-7daa-4c4d-b333-0d2359ad0c7e	52afddec-3cae-42ce-9092-8440e1fa8014	00000000-0000-4000-8000-000000000001
+a25f8c26-ed95-4a4d-b645-44f520c85dd4	66a9dc9f-5b19-4f79-9eb5-1d7cdb49ef82	00000000-0000-4000-8000-000000000002
+0db2c4f3-a216-4fb7-9bc0-b628c542079d	5af69b55-ef40-4fc8-8430-71f1a19f8f75	00000000-0000-4000-8000-000000000001
+01fdb5e8-4c02-4b28-9004-e05484a86285	a5c46085-e9c5-4c24-ad52-3aaf0eb75ced	00000000-0000-4000-8000-000000000001
+de0af4f5-2628-49a1-a22a-089eea398825	9d2863fc-0252-4cfe-be88-d19047ffa885	00000000-0000-4000-8000-000000000001
+aac4cd40-4e8e-4af0-ae19-f321b6965204	2968342a-95a1-46e5-a23c-c392fce4f451	00000000-0000-4000-8000-000000000001
+8e1c46e9-f41c-4c8f-ab66-6b056b04ab9d	19791a1c-fe79-4c25-9175-506bde74134f	00000000-0000-4000-8000-000000000001
+f9036c1b-65b0-4580-883b-84da2e370d2a	5d2b0a94-cb50-433e-b654-525045548590	00000000-0000-4000-8000-000000000001
+f9569b96-fd7b-400b-a088-6d41c0c1df9f	044214c4-2c02-4f1c-a8e8-edcb23b9cb62	00000000-0000-4000-8000-000000000001
+fd6ecd50-0300-4073-a2eb-fe3e82900e18	e4108e51-f590-4296-82a4-be5627bb187f	00000000-0000-4000-8000-000000000001
+be26ec51-5591-459f-b979-b11e4cd5355e	e40c047f-b7e9-4f41-b20a-209baed651ac	00000000-0000-4000-8000-000000000001
+494997e2-8b71-4e01-bda2-cb382a4612d6	0249ef1d-3838-47cb-b070-17304161723e	00000000-0000-4000-8000-000000000001
+33aab1f7-b5a9-4ad3-9569-b3276d116092	299f2320-8499-413f-b2a6-c1ef3452b698	00000000-0000-4000-8000-000000000001
+35592894-aff4-408f-9324-82de30c6cdc4	1dd0dd8f-a315-4763-9040-59040cacbc6c	00000000-0000-4000-8000-000000000001
+66cad1be-c9c3-436c-8454-22fbd2a07037	2c008c6d-9a0f-4654-bda5-a1cabbdcce73	00000000-0000-4000-8000-000000000001
+57541868-04f0-4e10-8bed-9924ea3a0a4f	713f38a4-7b2c-42b0-8df4-424d54ef5d0f	00000000-0000-4000-8000-000000000005
+013c2de6-ece2-4d1d-8852-e4d57b9b4594	88d0f86d-f232-418b-a4de-65b94e037da6	00000000-0000-4000-8000-000000000001
+c49d3d91-5fbf-4726-b883-fb1b8aa0bbe2	37b93606-3e9f-4b43-a953-dad7985e39c4	00000000-0000-4000-8000-000000000004
+e6104cb6-cd3b-4450-90b8-27e877463646	85754a1b-816f-4575-906e-5139f3587788	00000000-0000-4000-8000-000000000002
 \.
 
 
@@ -11363,6 +11475,6 @@ SELECT pg_catalog.setval('"supabase_functions"."hooks_id_seq"', 5, true);
 -- PostgreSQL database dump complete
 --
 
--- \unrestrict zG76L69sK94VLaPSIJ1AImSkNfHYnfpMMz9tf3bQmXa9G4nzemgV4OjrHSgMBFJ
+-- \unrestrict jMtcMDzmiZVA8PUaNfCqzPiiS9uEtpXgEz7Y1O1lMsprMgSZOAW9tWjgQyNWyKn
 
 RESET ALL;
